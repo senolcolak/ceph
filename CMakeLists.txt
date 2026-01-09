@@ -734,7 +734,7 @@ if (WITH_SYSTEM_ROCKSDB)
   find_package(RocksDB 5.14 REQUIRED)
 endif()
 
-option(WITH_CRIMSON "Build seastar components")
+option(WITH_CRIMSON "Build Crimson components" OFF)
 
 # Boost
 option(WITH_SYSTEM_BOOST "require and build with system Boost" OFF)
@@ -760,6 +760,10 @@ endif()
 if(WITH_LIBCEPHFS OR WITH_FUSE)
   find_package(ICU REQUIRED COMPONENTS uc i18n)
   list(APPEND BOOST_COMPONENTS locale)
+endif()
+
+if(WITH_CEPHFS)
+  list(APPEND BOOST_COMPONENTS filesystem)
 endif()
 
 set(Boost_USE_MULTITHREADED ON)
