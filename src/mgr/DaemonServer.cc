@@ -532,6 +532,24 @@ bool DaemonServer::handle_open(const ref_t<MMgrOpen>& m)
 				   m->get_connection()->get_peer_type(),
 				   m->daemon_name);
 
+  auto metadata = m->daemon_metadata;
+  if (key.type == "osd") {
+    try {
+      int osd_id = std::stoi(key.name);
+      cluster_state.with_osdmap([&](const OSDMap& osdmap) {
+        if (osdmap.crush) {
+          std::map<std::string,std::string> loc =
+            osdmap.crush->get_full_location(osd_id);
+          auto it = loc.find("host");
+          if (it != loc.end()) {
+            metadata["hostname"] = it->second;
+          }
+        }
+      });
+    } catch (...) {
+    }
+  }
+
   auto con = m->get_connection();
   dout(10) << "from " << key << " " << con->get_peer_addr() << dendl;
 
@@ -565,7 +583,7 @@ bool DaemonServer::handle_open(const ref_t<MMgrOpen>& m)
     if (m->service_daemon) {
       // update the metadata through the daemon state index to
       // ensure it's kept up-to-date
-      daemon_state.update_metadata(daemon, m->daemon_metadata);
+      daemon_state.update_metadata(daemon, metadata);
     }
 
     std::lock_guard l(daemon->lock);
@@ -584,7 +602,7 @@ bool DaemonServer::handle_open(const ref_t<MMgrOpen>& m)
 	d->addr = m->get_source_addr();
 	d->start_epoch = pending_service_map.epoch;
 	d->start_stamp = now;
-	d->metadata = m->daemon_metadata;
+	d->metadata = metadata;
 	pending_service_map_dirty = pending_service_map.epoch;
       }
     }
@@ -649,7 +667,24 @@ bool DaemonServer::handle_update(const ref_t<MMgrUpdate>& m)
       daemon = daemon_state.get(key);
       if (m->need_metadata_update &&
           !m->daemon_metadata.empty()) {
-        daemon_state.update_metadata(daemon, m->daemon_metadata);
+        auto metadata = m->daemon_metadata;
+        if (key.type == "osd") {
+          try {
+            int osd_id = std::stoi(key.name);
+            cluster_state.with_osdmap([&](const OSDMap& osdmap) {
+              if (osdmap.crush) {
+                std::map<std::string,std::string> loc =
+                  osdmap.crush->get_full_location(osd_id);
+                auto it = loc.find("host");
+                if (it != loc.end()) {
+                  metadata["hostname"] = it->second;
+                }
+              }
+            });
+          } catch (...) {
+          }
+        }
+        daemon_state.update_metadata(daemon, metadata);
       }
     }
   }
