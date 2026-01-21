@@ -1438,7 +1438,32 @@ void RGWPutBucketTags::execute(optional_yield y)
   op_ret = retry_raced_bucket_write(this, s->bucket.get(), [this, y] {
     rgw::sal::Attrs attrs = s->bucket->get_attrs();
     attrs[RGW_ATTR_TAGS] = tags_bl;
-    return s->bucket->merge_and_store_attrs(this, attrs, y);
+
+    RGWObjTags tags;
+    try {
+      auto bliter = tags_bl.cbegin();
+      tags.decode(bliter);
+    } catch (buffer::error& err) {
+      return -EINVAL;
+    }
+
+    bool wp_val = false;
+    for (const auto& tag : tags.get_tags()) {
+      if (tag.first == "rgw:write_protected") {
+        wp_val = (tag.second == "true");
+        break;
+      }
+    }
+
+    if (s->bucket->get_info().write_protected != wp_val) {
+      if (!s->auth.identity->is_admin()) {
+        return -EACCES;
+      }
+      s->bucket->get_info().write_protected = wp_val;
+    }
+
+    s->bucket->set_attrs(attrs);
+    return s->bucket->put_info(this, false, real_time(), y);
   }, y);
 
 }
@@ -1473,6 +1498,14 @@ void RGWDeleteBucketTags::execute(optional_yield y)
   op_ret = retry_raced_bucket_write(this, s->bucket.get(), [this, y] {
     rgw::sal::Attrs& attrs = s->bucket->get_attrs();
     attrs.erase(RGW_ATTR_TAGS);
+
+    if (s->bucket->get_info().write_protected) {
+      if (!s->auth.identity->is_admin()) {
+        return -EACCES;
+      }
+      s->bucket->get_info().write_protected = false;
+    }
+
     op_ret = s->bucket->put_info(this, false, real_time(), y);
     if (op_ret < 0) {
       ldpp_dout(this, 0) << "RGWDeleteBucketTags() failed to remove RGW_ATTR_TAGS on bucket="
@@ -3754,6 +3787,21 @@ int put_swift_bucket_metadata(const DoutPrefixProvider* dpp,
           s->bucket->get_info().swift_ver_location = *swift_ver_location;
           s->bucket->get_info().swift_versioning =
               (!swift_ver_location->empty());
+        }
+
+        string wp_key = RGW_ATTR_META_PREFIX "write-restricted";
+        auto it = attrs.find(wp_key);
+        bool new_wp = false;
+        if (it != attrs.end()) {
+          string v = rgw_bl_str(it->second);
+          new_wp = (rgw_str_to_bool(v.c_str(), 0) == 1);
+        }
+
+        if (s->bucket->get_info().write_protected != new_wp) {
+          if (!s->auth.identity->is_admin()) {
+            return -EACCES;
+          }
+          s->bucket->get_info().write_protected = new_wp;
         }
 
         /* Web site of Swift API. */

@@ -1640,6 +1640,14 @@ options:
   see_also:
   - rgw_enable_usage_log
   with_legacy: true
+- name: rgw_bucket_write_protection_enabled
+  type: bool
+  level: advanced
+  desc: Enable bucket write protection feature
+  long_desc: When enabled, buckets can be marked as write protected, preventing non-admin users from modifying them.
+  default: true
+  services:
+  - rgw
 - name: rgw_usage_max_user_shards
   type: int
   level: advanced

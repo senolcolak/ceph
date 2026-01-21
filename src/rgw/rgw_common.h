@@ -1127,6 +1127,8 @@ struct RGWBucketInfo {
 
   std::optional<rgw_sync_policy_info> sync_policy;
 
+  bool write_protected{false};
+
   void encode(bufferlist& bl) const;
   void decode(bufferlist::const_iterator& bl);
   void dump(Formatter *f) const;
@@ -1872,6 +1874,8 @@ extern int verify_object_lock(
   const rgw::sal::Attrs& attrs,
   const bool bypass_perm,
   const bool bypass_governance_mode);
+
+bool rgw_check_bucket_write_protection(const DoutPrefixProvider* dpp, CephContext* cct, const RGWBucketInfo& bucket_info, const rgw::auth::Identity& identity, int perm);
 
 /** Convert an input URL into a sane object name
  * by converting %-escaped std::strings into characters, etc*/

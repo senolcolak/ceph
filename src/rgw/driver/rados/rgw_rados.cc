@@ -2473,6 +2473,7 @@ int RGWRados::create_bucket(const DoutPrefixProvider* dpp,
                             std::optional<ceph::real_time> creation_time,
                             std::optional<rgw::BucketIndexType> index_type,
                             std::optional<uint32_t> index_shards,
+                            std::optional<bool> write_protected,
                             obj_version* pep_objv,
                             RGWBucketInfo& info)
 {
@@ -2500,6 +2501,9 @@ int RGWRados::create_bucket(const DoutPrefixProvider* dpp,
     }
     if (obj_lock_enabled) {
       info.flags |= BUCKET_VERSIONED | BUCKET_OBJ_LOCK_ENABLED;
+    }
+    if (write_protected) {
+      info.write_protected = *write_protected;
     }
 
     if (zone_placement) {
