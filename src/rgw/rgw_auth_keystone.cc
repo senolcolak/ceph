@@ -139,8 +139,8 @@ admin_token_retry:
 }
 
 TokenEngine::auth_info_t
-TokenEngine::get_creds_info(const TokenEngine::token_envelope_t& token
-                           ) const noexcept
+TokenEngine::get_creds_info(const TokenEngine::token_envelope_t& token,
+                            uint32_t perm_mask) const noexcept
 {
   using acct_privilege_t = rgw::auth::RemoteApplier::AuthInfo::acct_privilege_t;
 
@@ -160,7 +160,7 @@ TokenEngine::get_creds_info(const TokenEngine::token_envelope_t& token
     token.get_project_name(),
     /* Keystone doesn't support RGW's subuser concept, so we cannot cut down
      * the access rights through the perm_mask. At least at this layer. */
-    RGW_PERM_FULL_CONTROL,
+    perm_mask,
     level,
     rgw::auth::RemoteApplier::AuthInfo::NO_ACCESS_KEY,
     rgw::auth::RemoteApplier::AuthInfo::NO_SUBUSER,
@@ -240,15 +240,19 @@ TokenEngine::authenticate(const DoutPrefixProvider* dpp,
    * also thread-safe. */
   static const struct RolesCacher {
     explicit RolesCacher(CephContext* const cct) {
-      get_str_vec(cct->_conf->rgw_keystone_accepted_roles, plain);
+      get_str_vec(cct->_conf->rgw_keystone_accepted_roles, regular);
       get_str_vec(cct->_conf->rgw_keystone_accepted_admin_roles, admin);
       get_str_vec(cct->_conf->rgw_keystone_accepted_reader_roles, reader);
 
+      plain = regular;
       /* Let's suppose that having an admin role implies also a regular one. */
       plain.insert(std::end(plain), std::begin(admin), std::end(admin));
+      /* Reader roles are also accepted. */
+      plain.insert(std::end(plain), std::begin(reader), std::end(reader));
     }
 
     std::vector<std::string> plain;
+    std::vector<std::string> regular;
     std::vector<std::string> admin;
     std::vector<std::string> reader;
   } roles(cct);
@@ -372,6 +376,32 @@ TokenEngine::authenticate(const DoutPrefixProvider* dpp,
   /* Check for necessary roles. */
   for (const auto& role : roles.plain) {
     if (t->has_role(role) == true) {
+      uint32_t perm_mask = RGW_PERM_FULL_CONTROL;
+      bool is_admin = false;
+      bool is_regular = false;
+      bool is_reader = false;
+
+      for (const auto& token_role : t->roles) {
+        if (token_role.is_admin) is_admin = true;
+        if (token_role.is_reader) is_reader = true;
+
+        for (const auto& reg : roles.regular) {
+          if (fnmatch(reg.c_str(), token_role.name.c_str(), 0) == 0) {
+            is_regular = true;
+            break;
+          }
+        }
+      }
+
+      if (is_admin || is_regular) {
+        perm_mask = RGW_PERM_FULL_CONTROL;
+      } else if (is_reader) {
+        perm_mask = RGW_PERM_READ;
+      } else {
+        /* This should be unreachable */
+        return result_t::deny(-EPERM);
+      }
+
       /* If this token was an allowed expired token because we got a
        * service token we need to update the expiration before we cache it. */
       if (allow_expired) {
@@ -389,7 +419,7 @@ TokenEngine::authenticate(const DoutPrefixProvider* dpp,
                     << " expires: " << t->get_expires() << dendl;
       token_cache.add(token_id, *t);
       auto apl = apl_factory->create_apl_remote(cct, s, get_acl_strategy(*t),
-                                                get_creds_info(*t));
+                                                get_creds_info(*t, perm_mask));
       return result_t::grant(std::move(apl));
     }
   }

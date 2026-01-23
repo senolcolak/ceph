@@ -44,7 +44,8 @@ class TokenEngine : public rgw::auth::Engine {
                     optional_yield y) const;
 
   acl_strategy_t get_acl_strategy(const token_envelope_t& token) const;
-  auth_info_t get_creds_info(const token_envelope_t& token) const noexcept;
+  auth_info_t get_creds_info(const token_envelope_t& token,
+                             uint32_t perm_mask) const noexcept;
   result_t authenticate(const DoutPrefixProvider* dpp,
                         const std::string& token,
                         const std::string& service_token,
