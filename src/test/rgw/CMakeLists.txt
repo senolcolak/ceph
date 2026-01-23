@@ -427,3 +427,10 @@ add_catch2_test_rgw(rgw_hex)
 add_executable(unittest_rgw_async_utils test_rgw_async_utils.cc)
 add_ceph_unittest(unittest_rgw_async_utils)
 target_link_libraries(unittest_rgw_async_utils ${rgw_libs} ${UNITTEST_LIBS})
+
+# unittest_bucket_write_protection
+add_executable(unittest_bucket_write_protection test_bucket_write_protection.cc)
+add_ceph_unittest(unittest_bucket_write_protection)
+target_include_directories(unittest_bucket_write_protection
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
+target_link_libraries(unittest_bucket_write_protection ${rgw_libs} ${UNITTEST_LIBS})

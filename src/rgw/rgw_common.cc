@@ -1366,6 +1366,10 @@ bool verify_bucket_permission(const DoutPrefixProvider* dpp,
                               const vector<Policy>& session_policies,
                               const uint64_t op, bool* granted_by_acl)
 {
+  if (!rgw_check_bucket_write_protection(dpp, s->cct, s->bucket_info, *s->identity, op_to_perm(op))) {
+    return false;
+  }
+
   if (!verify_requester_payer_permission(s))
     return false;
 
@@ -1448,6 +1452,10 @@ bool verify_bucket_permission_no_policy(const DoutPrefixProvider* dpp,
 					const RGWAccessControlPolicy& bucket_acl,
 					const int perm, bool* granted_by_acl)
 {
+  if (!rgw_check_bucket_write_protection(dpp, ps->cct, ps->bucket_info, *ps->identity, perm)) {
+    return false;
+  }
+
   if ((perm & (int)ps->perm_mask) != perm)
     return false;
 
@@ -1538,6 +1546,10 @@ bool verify_object_permission(const DoutPrefixProvider* dpp, struct perm_state_b
                               const vector<Policy>& session_policies,
                               const uint64_t op, bool* granted_by_acl)
 {
+  if (!rgw_check_bucket_write_protection(dpp, ps->cct, ps->bucket_info, *ps->identity, op_to_perm(op))) {
+    return false;
+  }
+
   if (!verify_requester_payer_permission(ps))
     return false;
 
@@ -1621,6 +1633,10 @@ bool verify_object_permission_no_policy(const DoutPrefixProvider* dpp,
 					const RGWAccessControlPolicy& object_acl,
 					const int perm, bool *granted_by_acl)
 {
+  if (!rgw_check_bucket_write_protection(dpp, ps->cct, ps->bucket_info, *ps->identity, perm)) {
+    return false;
+  }
+
   if (check_deferred_bucket_only_acl(dpp, ps, user_acl, bucket_acl, RGW_DEFER_TO_BUCKET_ACLS_RECURSE, perm, granted_by_acl) ||
       check_deferred_bucket_only_acl(dpp, ps, user_acl, bucket_acl, RGW_DEFER_TO_BUCKET_ACLS_FULL_CONTROL, RGW_PERM_FULL_CONTROL, granted_by_acl)) {
     return true;
@@ -1734,6 +1750,26 @@ int verify_object_lock(const DoutPrefixProvider* dpp, const rgw::sal::Attrs& att
   }
   
   return 0;
+}
+
+bool rgw_check_bucket_write_protection(const DoutPrefixProvider* dpp, CephContext* cct, const RGWBucketInfo& bucket_info, const rgw::auth::Identity& identity, int perm) {
+  if (!cct->_conf->rgw_bucket_write_protection_enabled) {
+    return true;
+  }
+  if (!bucket_info.write_protected) {
+    return true;
+  }
+  // Check if operation is mutating
+  if (!(perm & (RGW_PERM_WRITE | RGW_PERM_WRITE_ACP | RGW_PERM_WRITE_OBJS))) {
+    return true;
+  }
+  // Check if user is admin
+  if (identity.is_admin()) {
+    return true;
+  }
+
+  ldpp_dout(dpp, 10) << "Bucket is write protected and user is not admin. Access denied." << dendl;
+  return false;
 }
 
 
@@ -2336,7 +2372,7 @@ void RGWBucketInfo::encode(bufferlist& bl) const {
   const rgw_user* user = std::get_if<rgw_user>(&owner);
   std::string empty;
 
-  ENCODE_START(24, 4, bl);
+  ENCODE_START(25, 4, bl);
   encode(bucket, bl);
   if (user) {
     encode(user->id, bl);
@@ -2383,12 +2419,13 @@ void RGWBucketInfo::encode(bufferlist& bl) const {
     encode(empty, bl);
   }
   ceph::versioned_variant::encode(owner, bl); // v24
+  encode(write_protected, bl); // v25
   ENCODE_FINISH(bl);
 }
 
 void RGWBucketInfo::decode(bufferlist::const_iterator& bl) {
   rgw_user user;
-  DECODE_START_LEGACY_COMPAT_LEN_32(24, 4, 4, bl);
+  DECODE_START_LEGACY_COMPAT_LEN_32(25, 4, 4, bl);
   decode(bucket, bl);
   if (struct_v >= 2) {
     string s;
@@ -2469,6 +2506,9 @@ void RGWBucketInfo::decode(bufferlist::const_iterator& bl) {
     ceph::versioned_variant::decode(owner, bl);
   } else {
     owner = std::move(user); // user was decoded piecewise above
+  }
+  if (struct_v >= 25) {
+    decode(write_protected, bl);
   }
 
   if (layout.logs.empty() &&
@@ -2617,6 +2657,9 @@ void RGWBucketInfo::dump(Formatter *f) const
   if (obj_lock_enabled()) {
     encode_json("obj_lock", obj_lock, f);
   }
+  if (write_protected) {
+    encode_json("write_protected", write_protected, f);
+  }
 }
 
 void RGWBucketInfo::decode_json(JSONObj *obj) {
@@ -2663,6 +2706,7 @@ void RGWBucketInfo::decode_json(JSONObj *obj) {
   if (obj_lock_enabled()) {
     JSONDecoder::decode_json("obj_lock", obj_lock, obj);
   }
+  JSONDecoder::decode_json("write_protected", write_protected, obj);
 }
 
 list<RGWUserInfo> RGWUserInfo::generate_test_instances()
