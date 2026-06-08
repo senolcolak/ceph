@@ -952,6 +952,13 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_keystone_accepted_project_reader_roles
+  type: str
+  level: advanced
+  desc: Keystone roles that grant project-scoped read-only access. Users with one of these roles may perform read operations on any bucket within their Keystone project without per-bucket ACL or policy configuration. Mirrors Swift keystoneauth project_reader_roles behavior.
+  services:
+  - rgw
+  with_legacy: true
 - name: rgw_keystone_token_cache_size
   type: int
   level: advanced
