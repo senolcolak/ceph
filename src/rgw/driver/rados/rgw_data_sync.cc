@@ -1532,6 +1532,10 @@ public:
                                               complete->timestamp));
           if (retcode < 0) {
             tn->log(0, SSTR("ERROR: failed to log sync failure in error repo: retcode=" << retcode));
+            // The outer data-log marker must not advance unless this failed
+            // bucket obligation has durable retry ownership. Returning here
+            // leaves the marker unfinished so the data-log entry is replayed.
+            return set_cr_error(retcode);
           }
         }
       } else if (complete->retry) {
@@ -1727,6 +1731,9 @@ public:
                                             timestamp));
         if (retcode < 0) {
           tn->log(0, SSTR("ERROR: failed to log " << source_bs.shard_id << " in error repo: retcode=" << retcode));
+          // Do not let marker_tracker->finish() overwrite this failure. The
+          // full-sync entry must be replayed until retry ownership is durable.
+          return set_cr_error(retcode);
         }
         yield call(marker_tracker->finish(key));
         return set_cr_error(retcode);
