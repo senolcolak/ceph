@@ -220,13 +220,12 @@ TokenEngine::get_acl_strategy(const TokenEngine::token_envelope_t& token) const
 
     for (const auto& r : token_roles) {
       if (r.is_reader) {
-        if (r.is_admin) {    /* system scope reader persona */
-          /*
-           * Because system reader defeats permissions,
-           * we don't even look at the aclspec.
-           */
-          perm |= RGW_OP_TYPE_READ;
-        }
+        /* Grant read access: either system-scope (is_admin=true) or
+         * project-scoped (is_admin=false, mirrors Swift project_reader_roles).
+         * Cross-project leakage is not possible: a Keystone token is scoped
+         * to a single project and Swift handlers bind auth_tenant from the
+         * token's project_id for all bucket lookups. */
+        perm |= RGW_OP_TYPE_READ;
       }
     }
 
@@ -252,8 +251,15 @@ TokenEngine::authenticate(const DoutPrefixProvider* dpp,
       get_str_vec(cct->_conf->rgw_keystone_accepted_admin_roles, admin);
       get_str_vec(cct->_conf->rgw_keystone_accepted_reader_roles, reader);
 
+      std::vector<std::string> project_reader;
+      get_str_vec(cct->_conf->rgw_keystone_accepted_project_reader_roles, project_reader);
+
       /* Let's suppose that having an admin role implies also a regular one. */
       plain.insert(std::end(plain), std::begin(admin), std::end(admin));
+      /* Project readers must also pass the accepted-roles gate. */
+      plain.insert(std::end(plain), std::begin(project_reader), std::end(project_reader));
+      /* Merge project_reader into reader so update_roles stamps is_reader=true. */
+      reader.insert(std::end(reader), std::begin(project_reader), std::end(project_reader));
     }
 
     std::vector<std::string> plain;

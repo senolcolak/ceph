@@ -191,6 +191,23 @@ policies and idenitity policies with ``StringEquals``, ``StringNotEquals`` etc.
 
 See :doc:`bucketpolicy` for list of supported condition keys.
 
+Project-Scoped Reader Roles
+---------------------------
+
+The ``rgw_keystone_accepted_project_reader_roles`` configuration option allows you to
+specify Keystone role names that grant project-scoped read-only access to the Ceph
+Object Gateway. A comma-separated list of role names can be configured::
+
+   rgw_keystone_accepted_project_reader_roles = objectstore_viewer
+
+Any user whose Keystone token carries one of these roles is permitted to perform
+read operations (GET, HEAD, LIST) on buckets within their Keystone project, without
+requiring a per-bucket ACL or S3 Bucket Policy entry.
+
+This mirrors the behavior of Swift's ``keystoneauth`` middleware
+``project_reader_roles`` option. Users with only this role and no other granting role
+are restricted to read-only operations. Write operations (PUT, DELETE, POST) will be denied.
+
 Service Token Support
 ---------------------
 
