@@ -121,6 +121,16 @@ TEST_F(SigV4CanonicalHeaders, FullySignedRequestIsAccepted)
   EXPECT_NE(canon->find("host:rgw.example.com\n"), std::string::npos);
 }
 
+TEST_F(SigV4CanonicalHeaders, SessionTokenIsCanonicalizedWhenSigned)
+{
+  const auto canon = canonicalize(
+    {{"HTTP_X_AMZ_SECURITY_TOKEN", "session-token-value"}},
+    BASE_SIGNED + ";x-amz-security-token");
+  ASSERT_TRUE(canon);
+  EXPECT_NE(canon->find("x-amz-security-token:session-token-value\n"),
+            std::string::npos);
+}
+
 /* [INVARIANT] `host` has to be in SignedHeaders. */
 TEST_F(SigV4CanonicalHeaders, UnsignedHostIsRejected)
 {

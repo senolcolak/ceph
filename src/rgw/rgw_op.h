@@ -57,6 +57,7 @@ struct rgw_crypt_src_identity;
 #include "cls/rgw/cls_rgw_client.h"
 #include "rgw_public_access.h"
 #include "rgw_bucket_encryption.h"
+#include "rgw_tenant_cloud.h"
 #include "rgw_tracer.h"
 
 #include "include/ceph_assert.h"
@@ -669,6 +670,7 @@ class RGWPutBucketReplication : public RGWOp {
 protected:
   bufferlist in_data;
   std::vector<rgw_sync_policy_group> sync_policy_groups;
+  std::optional<rgw::tenant_cloud::Config> tenant_cloud_config;
 public:
   int verify_permission(optional_yield y) override;
   void execute(optional_yield y) override;

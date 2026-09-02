@@ -134,6 +134,36 @@ add_executable(unittest_rgw_bucket_sync_cache test_rgw_bucket_sync_cache.cc)
 add_ceph_unittest(unittest_rgw_bucket_sync_cache)
 target_link_libraries(unittest_rgw_bucket_sync_cache ${rgw_libs})
 
+# unittest_rgw_secure_endpoint_resolver
+add_executable(unittest_rgw_secure_endpoint_resolver
+  test_rgw_secure_endpoint_resolver.cc
+  $<TARGET_OBJECTS:unit-main>)
+add_ceph_unittest(unittest_rgw_secure_endpoint_resolver)
+target_link_libraries(unittest_rgw_secure_endpoint_resolver rgw_common ${rgw_libs})
+
+# unittest_rgw_tenant_cloud
+add_executable(unittest_rgw_tenant_cloud
+  test_rgw_tenant_cloud.cc
+  $<TARGET_OBJECTS:unit-main>)
+add_ceph_unittest(unittest_rgw_tenant_cloud)
+target_link_libraries(unittest_rgw_tenant_cloud rgw_common ${rgw_libs})
+
+if(WITH_RADOSGW_RADOS)
+# unittest_rgw_sync_s3_transfer
+add_executable(unittest_rgw_sync_s3_transfer
+  test_rgw_sync_s3_transfer.cc
+  $<TARGET_OBJECTS:unit-main>)
+add_ceph_unittest(unittest_rgw_sync_s3_transfer)
+target_link_libraries(unittest_rgw_sync_s3_transfer rgw_common ${rgw_libs})
+
+# unittest_rgw_tenant_cloud_sync
+add_executable(unittest_rgw_tenant_cloud_sync
+  test_rgw_tenant_cloud_sync.cc
+  $<TARGET_OBJECTS:unit-main>)
+add_ceph_unittest(unittest_rgw_tenant_cloud_sync)
+target_link_libraries(unittest_rgw_tenant_cloud_sync rgw_common ${rgw_libs})
+endif(WITH_RADOSGW_RADOS)
+
 #unittest_rgw_period_history
 add_executable(unittest_rgw_period_history test_rgw_period_history.cc)
 add_ceph_unittest(unittest_rgw_period_history)

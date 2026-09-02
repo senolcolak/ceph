@@ -1701,6 +1701,19 @@ void RGWPutBucketReplication::execute(optional_yield y) {
   if (op_ret < 0) 
     return;
 
+  const bool modifies_tenant_cloud = tenant_cloud_config ||
+    s->bucket->get_attrs().contains(rgw::tenant_cloud::config_attr);
+  if (modifies_tenant_cloud && !driver->is_meta_master()) {
+    // The existing forward path does not return the master's chosen config
+    // generations. Computing them again from potentially stale local metadata
+    // can diverge across zones, so this PoC accepts these writes only on the
+    // metadata master. A production API needs an authoritative-result protocol.
+    s->err.message =
+      "tenant-cloud replication must be configured on the metadata master";
+    op_ret = -ERR_NOT_IMPLEMENTED;
+    return;
+  }
+
   op_ret = rgw_forward_request_to_master(this, *s->penv.site, s->owner.id,
                                          &in_data, nullptr, s->info, s->err, y);
   if (op_ret < 0) {
@@ -1710,9 +1723,44 @@ void RGWPutBucketReplication::execute(optional_yield y) {
 
   op_ret = retry_raced_bucket_write(this, s->bucket.get(), [this, y] {
     auto sync_policy = (s->bucket->get_info().sync_policy ? *s->bucket->get_info().sync_policy : rgw_sync_policy_info());
-
     for (auto& group : sync_policy_groups) {
       sync_policy.groups[group.id] = group;
+    }
+
+    if (tenant_cloud_config) {
+      size_t pipe_count = 0;
+      bool found_external_pipe = false;
+      for (const auto& [group_id, group] : sync_policy.groups) {
+        for (const auto& pipe : group.pipes) {
+          ++pipe_count;
+          found_external_pipe = found_external_pipe ||
+            pipe.id == tenant_cloud_config->rule_id;
+        }
+      }
+      if (pipe_count != 1 || !found_external_pipe) {
+        s->err.message =
+          "External replication cannot coexist with other sync pipes";
+        return -EINVAL;
+      }
+    }
+
+    auto& attrs = s->bucket->get_attrs();
+    if (tenant_cloud_config) {
+      std::optional<rgw::tenant_cloud::Config> previous_config;
+      int ret = rgw::tenant_cloud::decode_config(attrs, &previous_config);
+      if (ret < 0) {
+        ldpp_dout(this, 0) << "ERROR: failed to decode tenant-cloud bucket configuration" << dendl;
+        return ret;
+      }
+
+      ret = rgw::tenant_cloud::advance_generation(
+        previous_config, &*tenant_cloud_config);
+      if (ret < 0) {
+        return ret;
+      }
+      rgw::tenant_cloud::encode_config(*tenant_cloud_config, &attrs);
+    } else {
+      attrs.erase(rgw::tenant_cloud::config_attr);
     }
 
     s->bucket->get_info().set_sync_policy(std::move(sync_policy));
@@ -1747,6 +1795,14 @@ int RGWDeleteBucketReplication::verify_permission(optional_yield y)
 
 void RGWDeleteBucketReplication::execute(optional_yield y)
 {
+  if (!driver->is_meta_master() &&
+      s->bucket->get_attrs().contains(rgw::tenant_cloud::config_attr)) {
+    s->err.message =
+      "tenant-cloud replication must be configured on the metadata master";
+    op_ret = -ERR_NOT_IMPLEMENTED;
+    return;
+  }
+
   op_ret = rgw_forward_request_to_master(this, *s->penv.site, s->owner.id,
                                          nullptr, nullptr, s->info, s->err, y);
   if (op_ret < 0) {
@@ -1755,8 +1811,14 @@ void RGWDeleteBucketReplication::execute(optional_yield y)
   }
 
   op_ret = retry_raced_bucket_write(this, s->bucket.get(), [this, y] {
+    auto& attrs = s->bucket->get_attrs();
+    const bool removed_tenant_cloud_config =
+      attrs.erase(rgw::tenant_cloud::config_attr) > 0;
     if (!s->bucket->get_info().sync_policy) {
-      return 0;
+      if (!removed_tenant_cloud_config) {
+        return 0;
+      }
+      return s->bucket->put_info(this, false, real_time(), y);
     }
 
     rgw_sync_policy_info sync_policy = *s->bucket->get_info().sync_policy;
@@ -3286,6 +3348,14 @@ void RGWSetBucketVersioning::execute(optional_yield y)
 
   if (! s->bucket_exists) {
     op_ret = -ERR_NO_SUCH_BUCKET;
+    return;
+  }
+
+  if (versioning_status != VersioningNotChanged &&
+      s->bucket->get_attrs().contains(rgw::tenant_cloud::config_attr)) {
+    s->err.message =
+      "bucket versioning cannot change while tenant-cloud replication is configured";
+    op_ret = -ERR_INVALID_BUCKET_STATE;
     return;
   }
 

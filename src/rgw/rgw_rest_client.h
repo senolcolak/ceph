@@ -8,6 +8,22 @@
 
 class RGWGetDataCB;
 
+// Ephemeral credentials for an outbound S3 request. This is intentionally
+// separate from RGWAccessKey, which is a persisted/user-key representation.
+struct RGWOutboundCredentials {
+  std::string access_key_id;
+  std::string secret_key;
+  std::optional<std::string> session_token;
+
+  RGWOutboundCredentials() = default;
+  RGWOutboundCredentials(std::string id, std::string secret,
+                         std::optional<std::string> token = std::nullopt)
+    : access_key_id(std::move(id)), secret_key(std::move(secret)),
+      session_token(std::move(token)) {}
+  explicit RGWOutboundCredentials(const RGWAccessKey& key)
+    : access_key_id(key.id), secret_key(key.key) {}
+};
+
 class RGWHTTPSimpleRequest : public RGWHTTPClient {
 protected:
   int http_status;
@@ -99,6 +115,9 @@ public:
   int set_obj_attrs(const DoutPrefixProvider *dpp, std::map<std::string, bufferlist>& rgw_attrs);
   void set_http_attrs(const std::map<std::string, std::string>& http_attrs);
   void set_policy(const RGWAccessControlPolicy& policy);
+  int sign(const DoutPrefixProvider *dpp,
+           const RGWOutboundCredentials& credentials,
+           const bufferlist *opt_content);
   int sign(const DoutPrefixProvider *dpp, RGWAccessKey& key, const bufferlist *opt_content);
 
   const RGWEndpoint& get_endpoint() const { return endpoint; }
@@ -183,7 +202,7 @@ public:
 };
 
 class RGWRESTStreamRWRequest : public RGWHTTPStreamRWRequest {
-  std::optional<RGWAccessKey> sign_key;
+  std::optional<RGWOutboundCredentials> sign_credentials;
   std::optional<RGWRESTGenerateHTTPHeaders> headers_gen;
   RGWEnv new_env;
   req_info new_info;
@@ -202,16 +221,20 @@ public:
   virtual ~RGWRESTStreamRWRequest() override {}
 
   int send_prepare(const DoutPrefixProvider *dpp, RGWAccessKey *key, std::map<std::string, std::string>& extra_headers, const std::string& resource, bufferlist *send_data = nullptr /* optional input data */);
+  int send_prepare(const DoutPrefixProvider *dpp, const RGWOutboundCredentials& credentials, std::map<std::string, std::string>& extra_headers, const std::string& resource, bufferlist *send_data = nullptr /* optional input data */);
   int send_prepare(const DoutPrefixProvider *dpp, RGWAccessKey& key, std::map<std::string, std::string>& extra_headers, const rgw_obj& obj);
+  int send_prepare(const DoutPrefixProvider *dpp, const RGWOutboundCredentials& credentials, std::map<std::string, std::string>& extra_headers, const rgw_obj& obj);
   int send(RGWHTTPManager *mgr) override;
 
   int send_request(const DoutPrefixProvider *dpp, RGWAccessKey& key, std::map<std::string, std::string>& extra_headers, const rgw_obj& obj, RGWHTTPManager *mgr);
+  int send_request(const DoutPrefixProvider *dpp, const RGWOutboundCredentials& credentials, std::map<std::string, std::string>& extra_headers, const rgw_obj& obj, RGWHTTPManager *mgr);
   int send_request(const DoutPrefixProvider *dpp, RGWAccessKey *key, std::map<std::string, std::string>& extra_headers, const std::string& resource, RGWHTTPManager *mgr, bufferlist *send_data = nullptr /* optional input data */);
+  int send_request(const DoutPrefixProvider *dpp, const RGWOutboundCredentials& credentials, std::map<std::string, std::string>& extra_headers, const std::string& resource, RGWHTTPManager *mgr, bufferlist *send_data = nullptr /* optional input data */);
 
   void add_params(param_vec_t *params);
 
 private:
-  int do_send_prepare(const DoutPrefixProvider *dpp, RGWAccessKey *key, std::map<std::string, std::string>& extra_headers, const std::string& resource, bufferlist *send_data = nullptr /* optional input data */);
+  int do_send_prepare(const DoutPrefixProvider *dpp, const RGWOutboundCredentials* credentials, std::map<std::string, std::string>& extra_headers, const std::string& resource, bufferlist *send_data = nullptr /* optional input data */);
 };
 
 class RGWRESTStreamReadRequest : public RGWRESTStreamRWRequest {
@@ -243,6 +266,7 @@ class RGWRESTStreamS3PutObj : public RGWHTTPStreamRWRequest {
   RGWEnv new_env;
   req_info new_info;
   RGWRESTGenerateHTTPHeaders headers_gen;
+  int prepare_result{0};
 public:
   RGWRESTStreamS3PutObj(CephContext *_cct, const std::string& _method, const RGWEndpoint& _endpoint, param_vec_t *_headers,
 		param_vec_t *_params, std::optional<std::string> _api_name,
@@ -252,12 +276,18 @@ public:
   ~RGWRESTStreamS3PutObj() override;
 
   void send_init(const rgw_obj& obj);
+  int send(RGWHTTPManager* mgr) override;
+  void send_ready(const DoutPrefixProvider *dpp, const RGWOutboundCredentials& credentials, std::map<std::string, bufferlist>& rgw_attrs);
+  void send_ready(const DoutPrefixProvider *dpp, const RGWOutboundCredentials& credentials, const std::map<std::string, std::string>& http_attrs,
+                  RGWAccessControlPolicy& policy);
+  void send_ready(const DoutPrefixProvider *dpp, const RGWOutboundCredentials& credentials);
   void send_ready(const DoutPrefixProvider *dpp, RGWAccessKey& key, std::map<std::string, bufferlist>& rgw_attrs);
   void send_ready(const DoutPrefixProvider *dpp, RGWAccessKey& key, const std::map<std::string, std::string>& http_attrs,
                   RGWAccessControlPolicy& policy);
   void send_ready(const DoutPrefixProvider *dpp, RGWAccessKey& key);
 
   void put_obj_init(const DoutPrefixProvider *dpp, RGWAccessKey& key, const rgw_obj& obj, std::map<std::string, bufferlist>& attrs);
+  void put_obj_init(const DoutPrefixProvider *dpp, const RGWOutboundCredentials& credentials, const rgw_obj& obj, std::map<std::string, bufferlist>& attrs);
 
   RGWGetDataCB *get_out_cb() { return out_cb; }
 };
