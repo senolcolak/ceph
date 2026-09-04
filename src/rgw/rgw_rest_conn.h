@@ -11,6 +11,11 @@
 
 #include <atomic>
 
+enum class RGWEndpointSelectionPolicy {
+  allow_fallback,
+  require_pinned,
+};
+
 class RGWSI_Zone;
 
 template<class T>
@@ -152,11 +157,6 @@ struct ResolvedEndpoint {
   }
 };
 
-enum class RGWEndpointSelectionPolicy {
-  allow_fallback,
-  require_pinned,
-};
-
 class RGWRESTConn
 {
   CephContext *cct;
@@ -169,7 +169,10 @@ class RGWRESTConn
   std::string remote_id;
   std::optional<std::string> api_name;
   HostStyle host_style;
-  RGWEndpointSelectionPolicy endpoint_policy = RGWEndpointSelectionPolicy::allow_fallback;
+  RGWEndpointSelectionPolicy endpoint_selection_policy =
+    RGWEndpointSelectionPolicy::allow_fallback;
+  RGWEndpointAddressPolicy endpoint_address_policy =
+    RGWEndpointAddressPolicy::unrestricted;
 
   void resolve_endpoints(void);
 
@@ -181,7 +184,8 @@ public:
               const std::list<std::string>& endpoints,
               std::optional<std::string> _api_name,
               HostStyle _host_style = PathStyle,
-              RGWEndpointSelectionPolicy _endpoint_policy = RGWEndpointSelectionPolicy::allow_fallback);
+              RGWEndpointSelectionPolicy _endpoint_policy = RGWEndpointSelectionPolicy::allow_fallback,
+              RGWEndpointAddressPolicy _address_policy = RGWEndpointAddressPolicy::unrestricted);
   RGWRESTConn(CephContext *_cct,
 	      const std::string& _remote_id,
 	      const std::list<std::string>& endpoints,
@@ -189,7 +193,8 @@ public:
 	      std::string _zone_group,
 	      std::optional<std::string> _api_name,
 	      HostStyle _host_style = PathStyle,
-              RGWEndpointSelectionPolicy _endpoint_policy = RGWEndpointSelectionPolicy::allow_fallback);
+              RGWEndpointSelectionPolicy _endpoint_policy = RGWEndpointSelectionPolicy::allow_fallback,
+              RGWEndpointAddressPolicy _address_policy = RGWEndpointAddressPolicy::unrestricted);
   RGWRESTConn(CephContext *_cct,
               const std::string& _remote_id,
               const std::list<std::string>& endpoints,
@@ -197,7 +202,8 @@ public:
               std::string _zone_group,
               std::optional<std::string> _api_name,
               HostStyle _host_style = PathStyle,
-              RGWEndpointSelectionPolicy _endpoint_policy = RGWEndpointSelectionPolicy::allow_fallback);
+              RGWEndpointSelectionPolicy _endpoint_policy = RGWEndpointSelectionPolicy::allow_fallback,
+              RGWEndpointAddressPolicy _address_policy = RGWEndpointAddressPolicy::unrestricted);
 
   // custom move needed for atomic
   RGWRESTConn(RGWRESTConn&& other);
@@ -238,7 +244,8 @@ public:
   /* sync request */
   auto forward(const DoutPrefixProvider *dpp, const rgw_owner& uid,
                const req_info& info, size_t max_response,
-               bufferlist *inbl, bufferlist *outbl, optional_yield y)
+               bufferlist *inbl, bufferlist *outbl, optional_yield y,
+               std::map<std::string, std::string>* response_headers = nullptr)
     -> tl::expected<int, int>;
 
   /* sync request */
@@ -351,12 +358,12 @@ class S3RESTConn : public RGWRESTConn {
 
 public:
 
-  S3RESTConn(CephContext *_cct, rgw::sal::Driver* driver, const std::string& _remote_id, const std::list<std::string>& endpoints, std::optional<std::string> _api_name, HostStyle _host_style = PathStyle, RGWEndpointSelectionPolicy _endpoint_policy = RGWEndpointSelectionPolicy::allow_fallback) :
-    RGWRESTConn(_cct, driver, _remote_id, endpoints, _api_name, _host_style, _endpoint_policy) {}
-  S3RESTConn(CephContext *_cct, const std::string& _remote_id, const std::list<std::string>& endpoints, RGWAccessKey _cred, std::string _zone_group, std::optional<std::string> _api_name, HostStyle _host_style = PathStyle, RGWEndpointSelectionPolicy _endpoint_policy = RGWEndpointSelectionPolicy::allow_fallback):
-    RGWRESTConn(_cct, _remote_id, endpoints, _cred, _zone_group, _api_name, _host_style, _endpoint_policy) {}
-  S3RESTConn(CephContext *_cct, const std::string& _remote_id, const std::list<std::string>& endpoints, RGWOutboundCredentials _cred, std::string _zone_group, std::optional<std::string> _api_name, HostStyle _host_style = PathStyle, RGWEndpointSelectionPolicy _endpoint_policy = RGWEndpointSelectionPolicy::allow_fallback):
-    RGWRESTConn(_cct, _remote_id, endpoints, std::move(_cred), _zone_group, _api_name, _host_style, _endpoint_policy) {}
+  S3RESTConn(CephContext *_cct, rgw::sal::Driver* driver, const std::string& _remote_id, const std::list<std::string>& endpoints, std::optional<std::string> _api_name, HostStyle _host_style = PathStyle, RGWEndpointSelectionPolicy _endpoint_policy = RGWEndpointSelectionPolicy::allow_fallback, RGWEndpointAddressPolicy _address_policy = RGWEndpointAddressPolicy::unrestricted) :
+    RGWRESTConn(_cct, driver, _remote_id, endpoints, _api_name, _host_style, _endpoint_policy, _address_policy) {}
+  S3RESTConn(CephContext *_cct, const std::string& _remote_id, const std::list<std::string>& endpoints, RGWAccessKey _cred, std::string _zone_group, std::optional<std::string> _api_name, HostStyle _host_style = PathStyle, RGWEndpointSelectionPolicy _endpoint_policy = RGWEndpointSelectionPolicy::allow_fallback, RGWEndpointAddressPolicy _address_policy = RGWEndpointAddressPolicy::unrestricted):
+    RGWRESTConn(_cct, _remote_id, endpoints, _cred, _zone_group, _api_name, _host_style, _endpoint_policy, _address_policy) {}
+  S3RESTConn(CephContext *_cct, const std::string& _remote_id, const std::list<std::string>& endpoints, RGWOutboundCredentials _cred, std::string _zone_group, std::optional<std::string> _api_name, HostStyle _host_style = PathStyle, RGWEndpointSelectionPolicy _endpoint_policy = RGWEndpointSelectionPolicy::allow_fallback, RGWEndpointAddressPolicy _address_policy = RGWEndpointAddressPolicy::unrestricted):
+    RGWRESTConn(_cct, _remote_id, endpoints, std::move(_cred), _zone_group, _api_name, _host_style, _endpoint_policy, _address_policy) {}
   ~S3RESTConn() override = default;
 
   void populate_params(param_vec_t& params, const rgw_owner* uid,

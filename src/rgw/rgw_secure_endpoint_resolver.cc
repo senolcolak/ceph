@@ -3,13 +3,39 @@
 
 #include "rgw_secure_endpoint_resolver.h"
 
+#include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cerrno>
+#include <cstring>
+#include <netinet/in.h>
+#include <string>
 
 #include <boost/url/parse.hpp>
 
 namespace rgw::secure_endpoint {
 namespace {
+
+std::string canonical_host(std::string_view host)
+{
+  while (!host.empty() && std::isspace(static_cast<unsigned char>(host.front()))) {
+    host.remove_prefix(1);
+  }
+  while (!host.empty() && std::isspace(static_cast<unsigned char>(host.back()))) {
+    host.remove_suffix(1);
+  }
+  if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+    host.remove_prefix(1);
+    host.remove_suffix(1);
+  }
+  if (!host.empty() && host.back() == '.') {
+    host.remove_suffix(1);
+  }
+  std::string result(host);
+  std::transform(result.begin(), result.end(), result.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return result;
+}
 
 bool in_range(uint32_t value, uint32_t first, uint32_t last)
 {
@@ -51,9 +77,15 @@ bool prohibited_v6(const boost::asio::ip::address_v6& address)
     return true;
   }
   const auto bytes = address.to_bytes();
-  if ((bytes[0] & 0xfe) == 0xfc ||
+  // Public IPv6 unicast is allocated from 2000::/3. Exclude the special-use
+  // subranges within it that must not be reached by tenant-controlled URLs.
+  if ((bytes[0] & 0xe0) != 0x20 ||
+      (bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] < 0x02) ||
       (bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x0d &&
-       bytes[3] == 0xb8)) {
+       bytes[3] == 0xb8) ||
+      (bytes[0] == 0x20 && bytes[1] == 0x02) ||
+      (bytes[0] == 0x3f && bytes[1] == 0xff &&
+       (bytes[2] & 0xf0) == 0)) {
     return true;
   }
   return false;
@@ -96,6 +128,28 @@ int validate_https_endpoint(std::string_view endpoint)
   return 0;
 }
 
+bool is_endpoint_host_allowed(std::string_view endpoint,
+                              std::string_view allowlist)
+{
+  const auto parsed = boost::urls::parse_uri(endpoint);
+  if (!parsed || parsed->host().empty()) {
+    return false;
+  }
+  const auto endpoint_host = canonical_host(parsed->host());
+  while (!allowlist.empty()) {
+    const auto separator = allowlist.find(',');
+    const auto candidate = canonical_host(allowlist.substr(0, separator));
+    if (!candidate.empty() && candidate == endpoint_host) {
+      return true;
+    }
+    if (separator == std::string_view::npos) {
+      break;
+    }
+    allowlist.remove_prefix(separator + 1);
+  }
+  return false;
+}
+
 bool is_prohibited_address(const boost::asio::ip::address& address)
 {
   if (address.is_v4()) {
@@ -109,6 +163,34 @@ bool is_prohibited_address(const boost::asio::ip::address& address)
     return prohibited_v4(boost::asio::ip::address_v4(v4bytes));
   }
   return prohibited_v6(v6);
+}
+
+bool is_prohibited_sockaddr(const sockaddr* address, socklen_t length)
+{
+  if (!address) {
+    return true;
+  }
+  if (address->sa_family == AF_INET) {
+    if (length < sizeof(sockaddr_in)) {
+      return true;
+    }
+    sockaddr_in value{};
+    std::memcpy(&value, address, sizeof(value));
+    boost::asio::ip::address_v4::bytes_type bytes{};
+    std::memcpy(bytes.data(), &value.sin_addr, bytes.size());
+    return is_prohibited_address(boost::asio::ip::address_v4(bytes));
+  }
+  if (address->sa_family == AF_INET6) {
+    if (length < sizeof(sockaddr_in6)) {
+      return true;
+    }
+    sockaddr_in6 value{};
+    std::memcpy(&value, address, sizeof(value));
+    boost::asio::ip::address_v6::bytes_type bytes{};
+    std::memcpy(bytes.data(), &value.sin6_addr, bytes.size());
+    return is_prohibited_address(boost::asio::ip::address_v6(bytes));
+  }
+  return true;
 }
 
 } // namespace rgw::secure_endpoint

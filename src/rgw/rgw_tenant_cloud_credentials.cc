@@ -36,6 +36,14 @@ void wipe(bufferlist& data)
     ::ceph::crypto::zeroize_for_security(buffer.c_str(), buffer.length());
   }
 }
+
+std::string credential_cache_key(const rgw_owner& owner,
+                                 const std::string& credential_ref)
+{
+  const auto owner_string = to_string(owner);
+  return std::to_string(owner_string.size()) + ":" + owner_string +
+         credential_ref;
+}
 }
 
 CredentialCache::CredentialCache(size_t max_entries, std::chrono::seconds ttl)
@@ -66,11 +74,40 @@ bool CredentialCache::get(const std::string& key, Credentials* result)
   return true;
 }
 
-void CredentialCache::put(const std::string& key, Credentials credentials)
+CredentialCache::Generation CredentialCache::get_generation(
+  const std::string& key)
+{
+  std::lock_guard guard(lock);
+  auto& weak = generations[key];
+  auto state = weak.lock();
+  if (!state) {
+    state = std::make_shared<uint64_t>(0);
+    weak = state;
+  }
+  Generation generation;
+  generation.state = std::move(state);
+  generation.value = *generation.state;
+  return generation;
+}
+
+bool CredentialCache::generation_is_current(
+  const std::string& key, const Generation& generation)
+{
+  std::lock_guard guard(lock);
+  const auto iter = generations.find(key);
+  const auto state = iter == generations.end() ? std::shared_ptr<uint64_t>{}
+                                               : iter->second.lock();
+  return state && generation.state && state == generation.state &&
+         *state == generation.value;
+}
+
+std::optional<uint64_t> CredentialCache::put(
+  const std::string& key, Credentials credentials,
+  const Generation* expected_generation)
 {
   if (max_entries == 0) {
     wipe(credentials);
-    return;
+    return std::nullopt;
   }
   const auto now = std::chrono::system_clock::now();
   auto expires = now + ttl;
@@ -80,17 +117,27 @@ void CredentialCache::put(const std::string& key, Credentials credentials)
   }
   if (expires <= now + std::chrono::seconds{30}) {
     wipe(credentials);
-    return;
+    return std::nullopt;
   }
+  const auto expires_at = static_cast<uint64_t>(
+    std::chrono::duration_cast<std::chrono::seconds>(
+      expires.time_since_epoch()).count());
+  credentials.cache_expires_at = expires_at;
 
   std::lock_guard guard(lock);
+  if (expected_generation &&
+      (!expected_generation->state ||
+       *expected_generation->state != expected_generation->value)) {
+    wipe(credentials);
+    return std::nullopt;
+  }
   auto i = entries.find(key);
   if (i != entries.end()) {
     wipe(i->second.credentials);
     i->second.credentials = std::move(credentials);
     i->second.expires = expires;
     lru.splice(lru.end(), lru, i->second.lru);
-    return;
+    return expires_at;
   }
   lru.push_back(key);
   entries.emplace(key, Entry{std::move(credentials), expires, std::prev(lru.end())});
@@ -102,6 +149,26 @@ void CredentialCache::put(const std::string& key, Credentials credentials)
       entries.erase(old);
     }
   }
+  return expires_at;
+}
+
+void CredentialCache::invalidate(const std::string& key)
+{
+  std::lock_guard guard(lock);
+  auto& weak = generations[key];
+  auto state = weak.lock();
+  if (!state) {
+    state = std::make_shared<uint64_t>(0);
+    weak = state;
+  }
+  ++*state;
+  auto i = entries.find(key);
+  if (i == entries.end()) {
+    return;
+  }
+  wipe(i->second.credentials);
+  lru.erase(i->second.lru);
+  entries.erase(i);
 }
 
 int parse_vault_credentials(bufferlist& response, Credentials* result)
@@ -144,6 +211,7 @@ class ResolveCR final : public RGWCoroutine {
   Credentials* result;
   std::shared_ptr<CredentialCache> cache;
   std::string cache_key;
+  CredentialCache::Generation cache_generation;
   bufferlist response;
   Credentials resolved;
   std::unique_ptr<RGWCoroutine> operation;
@@ -168,9 +236,12 @@ public:
       if (!result || validate(config, nullptr) < 0) {
         return set_cr_error(-EINVAL);
       }
-      cache_key = to_string(owner) + ":" + config.credential_ref;
+      cache_key = credential_cache_key(owner, config.credential_ref);
       if (cache && cache->get(cache_key, result)) {
         return set_cr_done();
+      }
+      if (cache) {
+        cache_generation = cache->get_generation(cache_key);
       }
       {
         const std::string logical = config.credential_ref.substr(8);
@@ -192,7 +263,21 @@ public:
           return set_cr_error(-EINVAL);
         }
       }
-      if (cache) cache->put(cache_key, resolved);
+      if (cache) {
+        const auto cache_expiry = cache->put(
+          cache_key, resolved, &cache_generation);
+        if (!cache_expiry) {
+          // A missing expiry is normally valid when caching is disabled or
+          // the provider credential is too close to expiry. It is not valid
+          // when invalidation advanced this request's generation: publishing
+          // that result would let stale in-flight credentials escape the
+          // refresh fence.
+          if (!cache->generation_is_current(cache_key, cache_generation)) {
+            return set_cr_error(-ECANCELED);
+          }
+        }
+        resolved.cache_expires_at = cache_expiry;
+      }
       wipe(*result);
       *result = std::move(resolved);
       return set_cr_done();
@@ -209,6 +294,14 @@ RGWCoroutine* VaultCredentialResolver::resolve(
   if (!cct) return nullptr;
   return new ResolveCR(cct, vault_config, std::move(owner),
                        std::move(config), result, cache);
+}
+
+void VaultCredentialResolver::invalidate(rgw_owner owner,
+                                         const Config& config)
+{
+  if (cache) {
+    cache->invalidate(credential_cache_key(owner, config.credential_ref));
+  }
 }
 
 } // namespace rgw::tenant_cloud

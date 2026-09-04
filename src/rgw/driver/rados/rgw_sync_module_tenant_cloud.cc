@@ -6,10 +6,15 @@
 
 #include <cerrno>
 #include <chrono>
+#include <iterator>
+#include <list>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include "rgw_bucket_sync.h"
@@ -24,6 +29,16 @@
 
 namespace {
 
+std::string context_cache_key(const rgw_owner& owner,
+                              const std::string& bucket_instance_id,
+                              uint64_t config_generation)
+{
+  const auto owner_string = to_string(owner);
+  return std::to_string(owner_string.size()) + ":" + owner_string +
+         std::to_string(bucket_instance_id.size()) + ":" +
+         bucket_instance_id + std::to_string(config_generation);
+}
+
 bool pipe_matches_source(const rgw_bucket_sync_pipe& pipe)
 {
   return pipe.info.source_bs.bucket == pipe.source_bucket_info.bucket &&
@@ -31,8 +46,149 @@ bool pipe_matches_source(const rgw_bucket_sync_pipe& pipe)
 }
 
 class RGWTenantCloudResolvedProvider final
-  : public rgw::tenant_cloud::TargetContextProvider {
+  : public rgw::tenant_cloud::TargetContextProvider,
+    public std::enable_shared_from_this<RGWTenantCloudResolvedProvider> {
   std::shared_ptr<rgw::tenant_cloud::CredentialResolver> resolver;
+  mutable std::mutex cache_lock;
+  struct CacheEntry {
+    rgw::tenant_cloud::TargetContextRef context;
+    std::chrono::steady_clock::time_point expires;
+    std::list<std::string>::iterator lru;
+  };
+  size_t max_cache_entries;
+  std::chrono::seconds cache_ttl;
+  mutable std::list<std::string> cache_lru;
+  mutable std::unordered_map<std::string, CacheEntry> cache;
+  struct Inflight {
+    bool done{false};
+    int result{-EIO};
+    rgw::tenant_cloud::TargetContextRef context;
+  };
+  std::unordered_map<std::string, std::shared_ptr<Inflight>> inflight;
+
+  rgw::tenant_cloud::TargetContextRef get_cached(
+    const std::string& key) const
+  {
+    std::lock_guard guard(cache_lock);
+    auto iter = cache.find(key);
+    if (iter == cache.end()) {
+      return {};
+    }
+    if (std::chrono::steady_clock::now() >= iter->second.expires) {
+      cache_lru.erase(iter->second.lru);
+      cache.erase(iter);
+      return {};
+    }
+    const auto& context = iter->second.context;
+    const auto credentials_expiry = context->credentials_refresh_at;
+    if (credentials_expiry) {
+      const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+      if (now < 0 || *credentials_expiry <=
+          static_cast<uint64_t>(now) + 30) {
+        cache_lru.erase(iter->second.lru);
+        cache.erase(iter);
+        return {};
+      }
+    }
+    cache_lru.splice(cache_lru.end(), cache_lru, iter->second.lru);
+    return context;
+  }
+
+  void put_cached_locked(std::string key,
+                         rgw::tenant_cloud::TargetContextRef context)
+  {
+    auto iter = cache.find(key);
+    if (iter != cache.end()) {
+      cache_lru.erase(iter->second.lru);
+      cache.erase(iter);
+    }
+    if (max_cache_entries == 0 || cache_ttl <= std::chrono::seconds::zero()) {
+      return;
+    }
+    cache_lru.push_back(key);
+    cache.emplace(
+      std::move(key),
+      CacheEntry{std::move(context), std::chrono::steady_clock::now() + cache_ttl,
+                 std::prev(cache_lru.end())});
+    while (cache.size() > max_cache_entries) {
+      auto old = cache.find(cache_lru.front());
+      cache_lru.pop_front();
+      if (old != cache.end()) {
+        cache.erase(old);
+      }
+    }
+  }
+
+  void invalidate_cached(const std::string& key)
+  {
+    std::lock_guard guard(cache_lock);
+    auto iter = cache.find(key);
+    if (iter != cache.end()) {
+      cache_lru.erase(iter->second.lru);
+      cache.erase(iter);
+    }
+    auto pending = inflight.find(key);
+    if (pending != inflight.end()) {
+      pending->second->result = -ECANCELED;
+      pending->second->context.reset();
+      pending->second->done = true;
+      inflight.erase(pending);
+    }
+  }
+
+  std::shared_ptr<Inflight> join_resolution(const std::string& key,
+                                            bool* leader)
+  {
+    std::lock_guard guard(cache_lock);
+    auto iter = inflight.find(key);
+    if (iter != inflight.end()) {
+      *leader = false;
+      return iter->second;
+    }
+    auto state = std::make_shared<Inflight>();
+    inflight.emplace(key, state);
+    *leader = true;
+    return state;
+  }
+
+  bool finish_resolution(const std::string& key,
+                         const std::shared_ptr<Inflight>& state,
+                         int result,
+                         rgw::tenant_cloud::TargetContextRef context)
+  {
+    std::lock_guard guard(cache_lock);
+    if (state->done) {
+      return false;
+    }
+    auto iter = inflight.find(key);
+    if (iter == inflight.end() || iter->second != state) {
+      return false;
+    }
+    state->result = result;
+    state->context = context;
+    state->done = true;
+    if (result == 0) {
+      put_cached_locked(key, std::move(context));
+    }
+    inflight.erase(iter);
+    return true;
+  }
+
+  bool consume_resolution(const std::shared_ptr<Inflight>& state,
+                          rgw::tenant_cloud::TargetContextRef* result,
+                          int* ret)
+  {
+    std::lock_guard guard(cache_lock);
+    if (!state->done) {
+      return false;
+    }
+    *ret = state->result;
+    if (state->result == 0 && result) {
+      *result = state->context;
+    }
+    return true;
+  }
 
   class ResolveCR final : public RGWCoroutine {
     RGWDataSyncCtx* sync;
@@ -41,6 +197,10 @@ class RGWTenantCloudResolvedProvider final
     std::string bucket_instance_id;
     rgw::tenant_cloud::Config config;
     rgw::tenant_cloud::TargetContextRef* result;
+    std::shared_ptr<RGWTenantCloudResolvedProvider> parent;
+    std::string cache_key;
+    std::shared_ptr<RGWTenantCloudResolvedProvider::Inflight> inflight;
+    bool leader{false};
     rgw::tenant_cloud::Credentials credentials;
     std::unique_ptr<RGWCoroutine> operation;
 
@@ -49,11 +209,22 @@ class RGWTenantCloudResolvedProvider final
               std::shared_ptr<rgw::tenant_cloud::CredentialResolver> resolver,
               rgw_owner owner, std::string bucket_instance_id,
               rgw::tenant_cloud::Config config,
-              rgw::tenant_cloud::TargetContextRef* result)
+              rgw::tenant_cloud::TargetContextRef* result,
+              std::shared_ptr<RGWTenantCloudResolvedProvider> parent)
       : RGWCoroutine(sync->cct), sync(sync), resolver(std::move(resolver)),
         owner(std::move(owner)),
         bucket_instance_id(std::move(bucket_instance_id)),
-        config(std::move(config)), result(result) {}
+        config(std::move(config)), result(result), parent(parent) {}
+
+    ~ResolveCR() override
+    {
+      // A coroutine can be destroyed while waiting on Vault. Leaders
+      // must publish a terminal result so that waiters never remain attached
+      // to an abandoned in-flight resolution.
+      if (leader && inflight) {
+        parent->finish_resolution(cache_key, inflight, -ECANCELED, {});
+      }
+    }
 
     int operate(const DoutPrefixProvider*) override
     {
@@ -61,19 +232,53 @@ class RGWTenantCloudResolvedProvider final
         if (!resolver || !result) {
           return set_cr_error(-EINVAL);
         }
+        // The operator allowlist is runtime-configurable. Recheck it even on
+        // a cache hit so a removed destination cannot keep using a stale
+        // target context until its TTL expires.
+        if (rgw::tenant_cloud::validate_endpoint_policy(
+              sync->cct, config, nullptr) < 0) {
+          return set_cr_error(-EINVAL);
+        }
+        cache_key = context_cache_key(owner, bucket_instance_id,
+                                      config.config_generation);
+        if (auto cached = parent->get_cached(cache_key)) {
+          *result = std::move(cached);
+          return set_cr_done();
+        }
+        inflight = parent->join_resolution(cache_key, &leader);
+        if (!leader) {
+          while (!parent->consume_resolution(inflight, result, &retcode)) {
+            yield wait(utime_t{0, 10000});
+          }
+          return retcode < 0 ? set_cr_error(retcode) : set_cr_done();
+        }
         operation.reset(resolver->resolve(owner, config, &credentials));
         if (!operation) {
+          parent->finish_resolution(cache_key, inflight, -EINVAL, {});
           return set_cr_error(-EINVAL);
         }
         yield call(operation.release());
         if (retcode < 0) {
+          parent->finish_resolution(cache_key, inflight, retcode, {});
           return set_cr_error(retcode);
         }
-        return rgw::tenant_cloud::build_target_context(
+        if (!sync->env || !sync->env->svc || !sync->env->svc->zone) {
+          parent->finish_resolution(cache_key, inflight, -EINVAL, {});
+          return set_cr_error(-EINVAL);
+        }
+        const int ret = rgw::tenant_cloud::build_target_context(
           sync->cct, owner, bucket_instance_id,
           sync->env->svc->zone->get_zonegroup().get_id(), config, credentials,
-          result) < 0
-          ? set_cr_error(-EIO) : set_cr_done();
+          result);
+        if (ret < 0) {
+          parent->finish_resolution(cache_key, inflight, ret, {});
+          return set_cr_error(ret);
+        }
+        if (!parent->finish_resolution(cache_key, inflight, 0, *result)) {
+          result->reset();
+          return set_cr_error(-ECANCELED);
+        }
+        return set_cr_done();
       }
       return 0;
     }
@@ -81,16 +286,30 @@ class RGWTenantCloudResolvedProvider final
 
 public:
   explicit RGWTenantCloudResolvedProvider(
-    std::shared_ptr<rgw::tenant_cloud::CredentialResolver> resolver)
-    : resolver(std::move(resolver)) {}
+    std::shared_ptr<rgw::tenant_cloud::CredentialResolver> resolver,
+    size_t max_cache_entries, std::chrono::seconds cache_ttl)
+    : resolver(std::move(resolver)), max_cache_entries(max_cache_entries),
+      cache_ttl(cache_ttl) {}
 
   RGWCoroutine* resolve(const DoutPrefixProvider* dpp, RGWDataSyncCtx* sync,
                         rgw_owner owner, std::string bucket_instance_id,
                         rgw::tenant_cloud::Config config,
                         rgw::tenant_cloud::TargetContextRef* result) override
   {
+    if (!sync || !sync->cct) {
+      return nullptr;
+    }
     return new ResolveCR(sync, resolver, std::move(owner),
-                         std::move(bucket_instance_id), std::move(config), result);
+                         std::move(bucket_instance_id), std::move(config), result,
+                         shared_from_this());
+  }
+
+  void invalidate(rgw_owner owner, const std::string& bucket_instance_id,
+                  const rgw::tenant_cloud::Config& config) override
+  {
+    resolver->invalidate(owner, config);
+    invalidate_cached(context_cache_key(owner, bucket_instance_id,
+                                        config.config_generation));
   }
 };
 
@@ -104,7 +323,8 @@ public:
   int operate(const DoutPrefixProvider* dpp) override
   {
     ldpp_dout(dpp, 0)
-      << "ERROR: tenant-cloud PoC does not support " << operation << dendl;
+      << "ERROR: tenant-cloud replication does not support "
+      << operation << dendl;
 
     // EIO is not one of RGWBucketSyncSingleEntryCR's ignored outcomes. This
     // keeps retry ownership in Ceph and prevents marker advancement.
@@ -117,6 +337,7 @@ class RGWTenantCloudDeleteCR final : public RGWCoroutine {
   std::shared_ptr<rgw::tenant_cloud::TargetContextProvider> provider;
   rgw_owner owner;
   std::string bucket_instance_id;
+  rgw_bucket source_bucket;
   rgw_obj_key key;
   std::optional<rgw::tenant_cloud::Config> config;
   int config_result;
@@ -124,6 +345,13 @@ class RGWTenantCloudDeleteCR final : public RGWCoroutine {
   rgw::tenant_cloud::TargetContextRef context;
   std::unique_ptr<RGWCoroutine> resolver;
   std::string path;
+  bool auth_retry{false};
+  int http_status{0};
+  ceph::real_time source_mtime;
+  uint64_t source_size{0};
+  std::string source_etag;
+  std::map<std::string, bufferlist> source_attrs;
+  std::map<std::string, std::string> source_headers;
 
 public:
   RGWTenantCloudDeleteCR(
@@ -135,6 +363,7 @@ public:
       provider(std::move(provider)),
       owner(sync_pipe.source_bucket_info.owner),
       bucket_instance_id(sync_pipe.source_bucket_info.bucket.bucket_id),
+      source_bucket(sync_pipe.source_bucket_info.bucket),
       key(key),
       config(),
       config_result(rgw::tenant_cloud::decode_config(
@@ -158,6 +387,26 @@ public:
         return set_cr_error(-EIO);
       }
 
+      // A delete event can be retried after a newer PUT has already appeared.
+      // Recheck source state before deleting the destination; the normal data
+      // sync ordering handles the remaining event when the object exists.
+      // Unit tests with no RADOS service use the injected target directly.
+      if (sync->env->async_rados) {
+        yield call(new RGWStatRemoteObjCR(
+          sync->env->async_rados, sync->env->driver, sync->source_zone,
+          source_bucket, key, &source_mtime, &source_size, &source_etag,
+          &source_attrs, &source_headers));
+        if (retcode == 0) {
+          return set_cr_done();
+        }
+        if (retcode != -ENOENT) {
+          return set_cr_error(
+            rgw::sync::s3::normalize_write_result(retcode));
+        }
+        retcode = 0;
+      }
+
+      while (true) {
       context.reset();
       resolver.reset(provider->resolve(dpp, sync, owner, bucket_instance_id,
                                        *config, &context));
@@ -177,12 +426,23 @@ public:
       }
 
       yield call(rgw::sync::s3::delete_object(
-        cct, context->target, sync->env->http_manager, path));
+        cct, context->target, sync->env->http_manager, path, &http_status));
       retcode = rgw::sync::s3::normalize_write_result(retcode);
       if (retcode < 0) {
+        ldpp_dout(dpp, 0)
+          << "tenant-cloud destination DELETE failed (endpoint="
+          << config->endpoint << ", http_status=" << http_status
+          << ", ret=" << retcode << ")" << dendl;
+        if (!auth_retry && (http_status == 401 || http_status == 403)) {
+          auth_retry = true;
+          provider->invalidate(owner, bucket_instance_id, *config);
+          retcode = 0;
+          continue;
+        }
         return set_cr_error(retcode);
       }
       return set_cr_done();
+      }
     }
     return 0;
   }
@@ -201,6 +461,7 @@ class RGWTenantCloudPutCBCR final : public RGWStatRemoteObjCBCR {
   rgw::sync::s3::SourceProperties properties;
   std::shared_ptr<RGWStreamReadHTTPResourceCRF> reader;
   std::shared_ptr<RGWStreamWriteHTTPResourceCRF> writer;
+  bool auth_retry{false};
 
 public:
   RGWTenantCloudPutCBCR(
@@ -220,7 +481,10 @@ public:
         return set_cr_error(-EIO);
       }
 
+      while (true) {
       context.reset();
+      reader.reset();
+      writer.reset();
       resolver.reset(provider->resolve(dpp, sc, owner, bucket_instance_id,
                                        config, &context));
       if (!resolver) {
@@ -259,9 +523,21 @@ public:
       yield call(new RGWStreamSpliceCR(
         cct, sync_env->http_manager, reader, writer));
       if (retcode < 0) {
+        const int http_status = writer->get_http_status();
+        ldpp_dout(dpp, 0)
+          << "tenant-cloud destination PUT failed (endpoint="
+          << config.endpoint << ", http_status=" << http_status
+          << ", ret=" << retcode << ")" << dendl;
+        if (!auth_retry && (http_status == 401 || http_status == 403)) {
+          auth_retry = true;
+          provider->invalidate(owner, bucket_instance_id, config);
+          retcode = 0;
+          continue;
+        }
         return set_cr_error(retcode);
       }
       return set_cr_done();
+      }
     }
     return 0;
   }
@@ -442,6 +718,9 @@ int build_target_context(CephContext* cct,
       (credentials.session_token && credentials.session_token->empty())) {
     return -EINVAL;
   }
+  if (validate_endpoint_policy(cct, config, nullptr) < 0) {
+    return -EINVAL;
+  }
 
   std::string destination_bucket;
   if (target_bucket_name(config, &destination_bucket) < 0) {
@@ -454,7 +733,8 @@ int build_target_context(CephContext* cct,
                            credentials.secret_key,
                            credentials.session_token),
     source_zonegroup_id, config.region, PathStyle,
-    RGWEndpointSelectionPolicy::require_pinned);
+    RGWEndpointSelectionPolicy::require_pinned,
+    RGWEndpointAddressPolicy::reject_prohibited);
   auto target = rgw::sync::s3::make_rest_target(conn);
   if (!target) {
     return -EIO;
@@ -471,16 +751,19 @@ int build_target_context(CephContext* cct,
   context->target_zone_id = config.target_zone_id;
   context->region = config.region;
   context->host_style = config.host_style;
+  context->credentials_refresh_at = credentials.cache_expires_at
+    ? credentials.cache_expires_at : credentials.expires_at;
   context->target = std::move(target);
   *result = std::move(context);
   return 0;
 }
 
 std::shared_ptr<TargetContextProvider> make_resolving_target_context_provider(
-  std::shared_ptr<CredentialResolver> resolver)
+  std::shared_ptr<CredentialResolver> resolver, size_t max_cache_entries,
+  std::chrono::seconds cache_ttl)
 {
   return resolver ? std::make_shared<RGWTenantCloudResolvedProvider>(
-                      std::move(resolver)) : nullptr;
+                      std::move(resolver), max_cache_entries, cache_ttl) : nullptr;
 }
 
 int make_delete_path(const TargetContext& context, const rgw_obj_key& key,
@@ -576,35 +859,45 @@ int RGWTenantCloudSyncModule::create_instance(
   if (!cct || !instance) {
     return -EINVAL;
   }
+  const auto configured_or_kms = [cct](const char* tenant_option,
+                                       const char* kms_option) {
+    auto value = cct->_conf.get_val<std::string>(tenant_option);
+    if (value.empty()) {
+      value = cct->_conf.get_val<std::string>(kms_option);
+    }
+    return value;
+  };
   RGWVaultConfig vault_config{
-    .address = cct->_conf.get_val<std::string>(
-      "rgw_tenant_cloud_vault_addr"),
-    .auth = cct->_conf.get_val<std::string>(
-      "rgw_tenant_cloud_vault_auth"),
-    .token_file = cct->_conf.get_val<std::string>(
-      "rgw_tenant_cloud_vault_token_file"),
-    .namespace_name = cct->_conf.get_val<std::string>(
-      "rgw_tenant_cloud_vault_namespace"),
+    .address = configured_or_kms("rgw_tenant_cloud_vault_addr",
+                                 "rgw_crypt_vault_addr"),
+    .auth = configured_or_kms("rgw_tenant_cloud_vault_auth",
+                              "rgw_crypt_vault_auth"),
+    .token_file = configured_or_kms("rgw_tenant_cloud_vault_token_file",
+                                    "rgw_crypt_vault_token_file"),
+    .namespace_name = configured_or_kms("rgw_tenant_cloud_vault_namespace",
+                                        "rgw_crypt_vault_namespace"),
     .prefix = cct->_conf.get_val<std::string>(
       "rgw_tenant_cloud_vault_prefix"),
-    .ssl_cacert = cct->_conf.get_val<std::string>(
-      "rgw_tenant_cloud_vault_ssl_cacert"),
-    .ssl_clientcert = cct->_conf.get_val<std::string>(
-      "rgw_tenant_cloud_vault_ssl_clientcert"),
-    .ssl_clientkey = cct->_conf.get_val<std::string>(
-      "rgw_tenant_cloud_vault_ssl_clientkey"),
+    .ssl_cacert = configured_or_kms("rgw_tenant_cloud_vault_ssl_cacert",
+                                    "rgw_crypt_vault_ssl_cacert"),
+    .ssl_clientcert = configured_or_kms("rgw_tenant_cloud_vault_ssl_clientcert",
+                                        "rgw_crypt_vault_ssl_clientcert"),
+    .ssl_clientkey = configured_or_kms("rgw_tenant_cloud_vault_ssl_clientkey",
+                                       "rgw_crypt_vault_ssl_clientkey"),
     .verify_ssl = cct->_conf.get_val<bool>(
       "rgw_tenant_cloud_vault_verify_ssl"),
   };
+  const auto credential_cache_size = cct->_conf.get_val<uint64_t>(
+    "rgw_tenant_cloud_credential_cache_size");
+  const auto credential_cache_ttl = std::chrono::seconds{
+    cct->_conf.get_val<uint64_t>(
+      "rgw_tenant_cloud_credential_cache_ttl_secs")};
   auto credentials = std::make_shared<rgw::tenant_cloud::VaultCredentialResolver>(
     cct, std::move(vault_config),
     std::make_shared<rgw::tenant_cloud::CredentialCache>(
-      cct->_conf.get_val<uint64_t>(
-        "rgw_tenant_cloud_credential_cache_size"),
-      std::chrono::seconds{cct->_conf.get_val<uint64_t>(
-        "rgw_tenant_cloud_credential_cache_ttl_secs")}));
+      credential_cache_size, credential_cache_ttl));
   auto provider = rgw::tenant_cloud::make_resolving_target_context_provider(
-    std::move(credentials));
+    std::move(credentials), credential_cache_size, credential_cache_ttl);
   instance->reset(new RGWTenantCloudSyncModuleInstance(std::move(provider)));
   return 0;
 }

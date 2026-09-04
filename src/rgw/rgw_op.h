@@ -76,7 +76,8 @@ int rgw_forward_request_to_master(const DoutPrefixProvider* dpp,
                                   const rgw_owner& effective_owner,
                                   bufferlist* indata, JSONParser* jp,
                                   const req_info& req, rgw_err& err,
-                                  optional_yield y);
+                                  optional_yield y,
+                                  std::map<std::string, std::string>* response_headers = nullptr);
 
 int rgw_op_get_bucket_policy_from_attr(const DoutPrefixProvider *dpp,
                                        CephContext *cct,
@@ -671,6 +672,7 @@ protected:
   bufferlist in_data;
   std::vector<rgw_sync_policy_group> sync_policy_groups;
   std::optional<rgw::tenant_cloud::Config> tenant_cloud_config;
+  std::optional<bool> tenant_cloud_master_result;
 public:
   int verify_permission(optional_yield y) override;
   void execute(optional_yield y) override;
@@ -686,6 +688,7 @@ public:
 class RGWDeleteBucketReplication : public RGWOp {
 protected:
   virtual void update_sync_policy(rgw_sync_policy_info *policy) = 0;
+  std::optional<bool> tenant_cloud_master_result;
 public:
   void pre_exec() override;
   int verify_permission(optional_yield y) override;

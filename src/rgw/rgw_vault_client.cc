@@ -7,9 +7,13 @@
 
 #include "common/ceph_crypto.h"
 #include "common/safe_io.h"
+#ifdef WITH_RADOSGW_RADOS
 #include "rgw_coroutine.h"
+#endif
 
+#ifdef WITH_RADOSGW_RADOS
 #include <boost/asio/yield.hpp>
+#endif
 
 namespace {
 
@@ -55,6 +59,7 @@ void append_url(std::string& url, std::string_view path)
   url.append(path);
 }
 
+#ifdef WITH_RADOSGW_RADOS
 class VaultRequestCR final : public RGWCoroutine {
   CephContext* cct;
   RGWVaultConfig config;
@@ -129,6 +134,7 @@ public:
     return 0;
   }
 };
+#endif
 
 int load_token(const std::string& path, std::string* token)
 {
@@ -218,6 +224,7 @@ int RGWVaultClient::request(const DoutPrefixProvider* dpp, const char* method,
   return ret;
 }
 
+#ifdef WITH_RADOSGW_RADOS
 RGWCoroutine* RGWVaultClient::request_async(const char* method,
                                              std::string_view path,
                                              std::string postdata,
@@ -229,3 +236,4 @@ RGWCoroutine* RGWVaultClient::request_async(const char* method,
   return new VaultRequestCR(cct, config, method, std::string(path),
                             std::move(postdata), response);
 }
+#endif

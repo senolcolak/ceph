@@ -121,7 +121,6 @@ set(librgw_common_srcs
   rgw_tag_s3.cc
   rgw_secure_endpoint_resolver.cc
   rgw_tenant_cloud.cc
-  rgw_tenant_cloud_credentials.cc
   rgw_vault_client.cc
   rgw_tools.cc
   rgw_user.cc
@@ -235,6 +234,9 @@ list(APPEND librgw_rados_srcs
   driver/rados/rgw_sync_counters.cc
   driver/rados/rgw_sync_error_repo.cc
   driver/rados/rgw_sync_module.cc
+  # Credential resolution is consumed only by the RADOS data-sync module.
+  # Keep coroutine-dependent code out of standalone RGW builds.
+  rgw_tenant_cloud_credentials.cc
   driver/rados/rgw_sync_s3_transfer.cc
   driver/rados/rgw_sync_module_aws.cc
   driver/rados/rgw_sync_module_es.cc

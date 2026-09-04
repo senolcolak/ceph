@@ -44,7 +44,8 @@ public:
   virtual RGWCoroutine* delete_object(CephContext* cct,
                                       RGWHTTPManager* http_manager,
                                       std::string path,
-                                      bool* not_found) = 0;
+                                      bool* not_found,
+                                      int* http_status = nullptr) = 0;
 };
 
 // Adapter for an existing REST connection. The shared ownership is retained by
@@ -102,7 +103,7 @@ public:
 
 RGWCoroutine* delete_object(CephContext* cct, std::shared_ptr<Target> target,
                             RGWHTTPManager* http_manager,
-                            std::string path);
+                            std::string path, int* http_status = nullptr);
 
 int normalize_delete_result(int result, bool remote_not_found);
 int normalize_write_result(int result);

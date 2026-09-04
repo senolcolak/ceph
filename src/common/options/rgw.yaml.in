@@ -3445,6 +3445,14 @@ options:
   default: 300
   services:
   - rgw
+- name: rgw_tenant_cloud_endpoint_allowlist
+  type: str
+  level: advanced
+  desc: Comma-separated exact hostnames permitted as tenant-cloud replication destinations. An empty value denies all destinations.
+  services:
+  - rgw
+  flags:
+  - runtime
 - name: rgw_crypt_kmip_addr
   type: str
   level: advanced

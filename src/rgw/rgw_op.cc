@@ -148,7 +148,8 @@ int rgw_forward_request_to_master(const DoutPrefixProvider* dpp,
                                   const rgw_owner& effective_owner,
                                   bufferlist* indata, JSONParser* jp,
                                   const req_info& req, rgw_err& err,
-                                  optional_yield y)
+                                  optional_yield y,
+                                  std::map<std::string, std::string>* response_headers)
 {
   const auto& period = site.get_period();
   if (!period) {
@@ -180,7 +181,8 @@ int rgw_forward_request_to_master(const DoutPrefixProvider* dpp,
   bufferlist outdata;
   constexpr size_t max_response_size = 128 * 1024; // we expect a very small response
   auto result = conn.forward(dpp, effective_owner, req,
-                             max_response_size, indata, &outdata, y);
+                             max_response_size, indata, &outdata, y,
+                             response_headers);
   if (!result) {
     return result.error();
   }
@@ -1701,24 +1703,47 @@ void RGWPutBucketReplication::execute(optional_yield y) {
   if (op_ret < 0) 
     return;
 
-  const bool modifies_tenant_cloud = tenant_cloud_config ||
-    s->bucket->get_attrs().contains(rgw::tenant_cloud::config_attr);
-  if (modifies_tenant_cloud && !driver->is_meta_master()) {
-    // The existing forward path does not return the master's chosen config
-    // generations. Computing them again from potentially stale local metadata
-    // can diverge across zones, so this PoC accepts these writes only on the
-    // metadata master. A production API needs an authoritative-result protocol.
-    s->err.message =
-      "tenant-cloud replication must be configured on the metadata master";
-    op_ret = -ERR_NOT_IMPLEMENTED;
-    return;
-  }
-
-  op_ret = rgw_forward_request_to_master(this, *s->penv.site, s->owner.id,
-                                         &in_data, nullptr, s->info, s->err, y);
+  std::map<std::string, std::string> master_headers;
+  op_ret = rgw_forward_request_to_master(
+    this, *s->penv.site, s->owner.id, &in_data, nullptr, s->info, s->err, y,
+    &master_headers);
   if (op_ret < 0) {
     ldpp_dout(this, 0) << "forward_request_to_master returned ret=" << op_ret << dendl;
     return;
+  }
+  if (auto i = master_headers.find("X_RGW_TENANT_CLOUD_STATE");
+      i != master_headers.end()) {
+    if (i->second != "0" && i->second != "1") {
+      s->err.message = "metadata master returned invalid tenant-cloud state";
+      op_ret = -EIO;
+      return;
+    }
+    tenant_cloud_master_result = i->second == "1";
+  }
+  // Tenant-cloud configuration is authoritative on the metadata master. A
+  // forwarded request has already been committed there; applying it again in
+  // a lagging zone can derive a different generation or reject after the
+  // master committed. Normal metadata propagation updates this zone.
+  if (!s->penv.site->is_meta_master()) {
+    if (!tenant_cloud_master_result.has_value()) {
+      // Keep the established forwarding behavior for ordinary replication
+      // requests. A missing marker is fatal only when this operation is
+      // explicitly tenant-cloud related (or the local object still carries
+      // that state); otherwise an older master remains compatible.
+      if (tenant_cloud_config ||
+          s->bucket->get_attrs().contains(rgw::tenant_cloud::config_attr)) {
+        s->err.message = "metadata master did not return tenant-cloud state";
+        op_ret = -EIO;
+        return;
+      }
+    } else if (*tenant_cloud_master_result) {
+      op_ret = 0;
+      return;
+    } else if (tenant_cloud_config) {
+      s->err.message = "metadata master rejected tenant-cloud state";
+      op_ret = -EIO;
+      return;
+    }
   }
 
   op_ret = retry_raced_bucket_write(this, s->bucket.get(), [this, y] {
@@ -1745,6 +1770,12 @@ void RGWPutBucketReplication::execute(optional_yield y) {
     }
 
     auto& attrs = s->bucket->get_attrs();
+    const bool had_tenant_cloud_config =
+      attrs.contains(rgw::tenant_cloud::config_attr);
+    if (!tenant_cloud_master_result.has_value()) {
+      tenant_cloud_master_result =
+        tenant_cloud_config.has_value() || had_tenant_cloud_config;
+    }
     if (tenant_cloud_config) {
       std::optional<rgw::tenant_cloud::Config> previous_config;
       int ret = rgw::tenant_cloud::decode_config(attrs, &previous_config);
@@ -1752,12 +1783,23 @@ void RGWPutBucketReplication::execute(optional_yield y) {
         ldpp_dout(this, 0) << "ERROR: failed to decode tenant-cloud bucket configuration" << dendl;
         return ret;
       }
-
-      ret = rgw::tenant_cloud::advance_generation(
-        previous_config, &*tenant_cloud_config);
+      uint64_t epoch = 0;
+      ret = rgw::tenant_cloud::decode_epoch(attrs, &epoch);
       if (ret < 0) {
         return ret;
       }
+
+      ret = rgw::tenant_cloud::advance_generation(
+        previous_config, epoch, &*tenant_cloud_config);
+      if (ret < 0) {
+        if (ret == -EOPNOTSUPP) {
+          s->err.message =
+            "Updating tenant-cloud replication is not supported";
+        }
+        return ret;
+      }
+      rgw::tenant_cloud::encode_epoch(
+        tenant_cloud_config->config_generation, &attrs);
       rgw::tenant_cloud::encode_config(*tenant_cloud_config, &attrs);
     } else {
       attrs.erase(rgw::tenant_cloud::config_attr);
@@ -1765,7 +1807,14 @@ void RGWPutBucketReplication::execute(optional_yield y) {
 
     s->bucket->get_info().set_sync_policy(std::move(sync_policy));
 
-    int ret = s->bucket->put_info(this, false, real_time(), y);
+    // A tenant-cloud PUT is also the explicit retry mechanism when the
+    // metadata write succeeded but activation scheduling previously failed.
+    // Online configuration changes are rejected by advance_generation(), so
+    // an enabled PUT is either first-enable or an identical retry.
+    const bool tenant_cloud_activation =
+      tenant_cloud_config && tenant_cloud_config->enabled;
+    int ret = s->bucket->put_info_with_activation(
+      this, false, real_time(), y, tenant_cloud_activation);
     if (ret < 0) {
       ldpp_dout(this, 0) << "ERROR: put_bucket_instance_info (bucket=" << s->bucket << ") returned ret=" << ret << dendl;
       return ret;
@@ -1795,23 +1844,42 @@ int RGWDeleteBucketReplication::verify_permission(optional_yield y)
 
 void RGWDeleteBucketReplication::execute(optional_yield y)
 {
-  if (!driver->is_meta_master() &&
-      s->bucket->get_attrs().contains(rgw::tenant_cloud::config_attr)) {
-    s->err.message =
-      "tenant-cloud replication must be configured on the metadata master";
-    op_ret = -ERR_NOT_IMPLEMENTED;
-    return;
-  }
-
-  op_ret = rgw_forward_request_to_master(this, *s->penv.site, s->owner.id,
-                                         nullptr, nullptr, s->info, s->err, y);
+  std::map<std::string, std::string> master_headers;
+  op_ret = rgw_forward_request_to_master(
+    this, *s->penv.site, s->owner.id, nullptr, nullptr, s->info, s->err, y,
+    &master_headers);
   if (op_ret < 0) {
     ldpp_dout(this, 0) << "forward_request_to_master returned ret=" << op_ret << dendl;
     return;
   }
+  if (auto i = master_headers.find("X_RGW_TENANT_CLOUD_STATE");
+      i != master_headers.end()) {
+    if (i->second != "0" && i->second != "1") {
+      s->err.message = "metadata master returned invalid tenant-cloud state";
+      op_ret = -EIO;
+      return;
+    }
+    tenant_cloud_master_result = i->second == "1";
+  }
+  if (!s->penv.site->is_meta_master()) {
+    if (!tenant_cloud_master_result.has_value()) {
+      if (s->bucket->get_attrs().contains(rgw::tenant_cloud::config_attr)) {
+        s->err.message = "metadata master did not return tenant-cloud state";
+        op_ret = -EIO;
+        return;
+      }
+    } else if (*tenant_cloud_master_result) {
+      op_ret = 0;
+      return;
+    }
+  }
 
   op_ret = retry_raced_bucket_write(this, s->bucket.get(), [this, y] {
     auto& attrs = s->bucket->get_attrs();
+    if (!tenant_cloud_master_result.has_value()) {
+      tenant_cloud_master_result =
+        attrs.contains(rgw::tenant_cloud::config_attr);
+    }
     const bool removed_tenant_cloud_config =
       attrs.erase(rgw::tenant_cloud::config_attr) > 0;
     if (!s->bucket->get_info().sync_policy) {

@@ -19,6 +19,7 @@ public:
   virtual ~CredentialResolver() = default;
   virtual RGWCoroutine* resolve(rgw_owner owner, Config config,
                                 Credentials* result) = 0;
+  virtual void invalidate(rgw_owner, const Config&) {}
 };
 
 class CredentialCache {
@@ -30,15 +31,29 @@ class CredentialCache {
   size_t max_entries;
   std::chrono::seconds ttl;
   std::mutex lock;
+  std::unordered_map<std::string, std::weak_ptr<uint64_t>> generations;
   std::list<std::string> lru;
   std::unordered_map<std::string, Entry> entries;
 
 public:
+  struct Generation {
+  private:
+    std::shared_ptr<uint64_t> state;
+    uint64_t value{0};
+    friend class CredentialCache;
+  };
+
   CredentialCache(size_t max_entries = 1024,
                   std::chrono::seconds ttl = std::chrono::seconds{300});
   ~CredentialCache();
   bool get(const std::string& key, Credentials* result);
-  void put(const std::string& key, Credentials credentials);
+  Generation get_generation(const std::string& key);
+  bool generation_is_current(const std::string& key,
+                             const Generation& generation);
+  std::optional<uint64_t> put(const std::string& key,
+                              Credentials credentials,
+                              const Generation* expected_generation = nullptr);
+  void invalidate(const std::string& key);
 };
 
 class VaultCredentialResolver final : public CredentialResolver {
@@ -54,6 +69,7 @@ public:
 
   RGWCoroutine* resolve(rgw_owner owner, Config config,
                         Credentials* result) override;
+  void invalidate(rgw_owner owner, const Config& config) override;
 };
 
 } // namespace rgw::tenant_cloud

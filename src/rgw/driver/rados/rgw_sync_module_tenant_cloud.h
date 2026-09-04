@@ -3,12 +3,16 @@
 
 #pragma once
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "rgw_obj_types.h"
+#include "rgw_rest_conn.h"
 #include "rgw_sync_module.h"
 #include "rgw_sync_s3_transfer.h"
 #include "rgw_tenant_cloud.h"
@@ -30,6 +34,7 @@ struct TargetContext {
   std::string target_zone_id;
   std::string region;
   std::string host_style;
+  std::optional<uint64_t> credentials_refresh_at;
   std::shared_ptr<rgw::sync::s3::Target> target;
 };
 
@@ -48,10 +53,13 @@ public:
                                 RGWDataSyncCtx* sync, rgw_owner owner,
                                 std::string bucket_instance_id, Config config,
                                 TargetContextRef* result) = 0;
+
+  virtual void invalidate(rgw_owner, const std::string&, const Config&) {}
 };
 
 std::shared_ptr<TargetContextProvider> make_resolving_target_context_provider(
-  std::shared_ptr<CredentialResolver> resolver);
+  std::shared_ptr<CredentialResolver> resolver, size_t max_cache_entries,
+  std::chrono::seconds cache_ttl);
 
 int target_bucket_name(const Config& config, std::string* bucket);
 int validate_target_context(const TargetContext& context,

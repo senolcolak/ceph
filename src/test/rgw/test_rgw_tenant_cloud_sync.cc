@@ -3,6 +3,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <list>
 #include <memory>
 #include <string>
 
@@ -12,6 +13,8 @@
 #include "rgw_bucket_sync.h"
 #include "rgw_data_sync.h"
 #include "rgw_sync_module_tenant_cloud.h"
+
+#include <boost/asio/yield.hpp>
 
 namespace tc = rgw::tenant_cloud;
 namespace s3 = rgw::sync::s3;
@@ -25,6 +28,23 @@ public:
     : RGWCoroutine(cct), result(result) {}
   int operate(const DoutPrefixProvider*) override {
     return result < 0 ? set_cr_error(result) : set_cr_done();
+  }
+};
+
+class DelayedErrorCR final : public RGWCoroutine {
+  int result;
+
+public:
+  DelayedErrorCR(CephContext* cct, int result)
+    : RGWCoroutine(cct), result(result) {}
+
+  int operate(const DoutPrefixProvider*) override
+  {
+    reenter(this) {
+      yield wait(utime_t{0, 1000});
+      return set_cr_error(result);
+    }
+    return 0;
   }
 };
 
@@ -53,7 +73,9 @@ public:
 class FakeTarget final : public s3::Target {
 public:
   bool delete_called{false};
+  unsigned delete_count{0};
   int delete_result{0};
+  int delete_status{0};
   int init_put(const rgw_obj&, RGWRESTStreamS3PutObj**) override
   {
     return -EIO;
@@ -62,9 +84,13 @@ public:
                   const rgw_rest_obj&,
                   const std::map<std::string, std::string>&) override {}
   RGWCoroutine* delete_object(CephContext* cct, RGWHTTPManager*,
-                              std::string, bool*) override
+                              std::string, bool*, int* http_status) override
   {
     delete_called = true;
+    ++delete_count;
+    if (http_status) {
+      *http_status = delete_status;
+    }
     return new DoneCR(cct, delete_result);
   }
 };
@@ -75,6 +101,8 @@ public:
   std::shared_ptr<FakeTarget> target;
   int resolve_result{0};
   unsigned resolve_count{0};
+  unsigned invalidate_count{0};
+  bool recover_on_invalidate{false};
 
   FakeProvider()
   {
@@ -101,6 +129,32 @@ public:
   {
     ++resolve_count;
     return new ResolveCR(sync->cct, context, result, resolve_result);
+  }
+
+  void invalidate(rgw_owner, const std::string&, const tc::Config&) override
+  {
+    ++invalidate_count;
+    if (recover_on_invalidate) {
+      target->delete_result = 0;
+      target->delete_status = 0;
+    }
+  }
+};
+
+class FakeCredentialResolver final : public tc::CredentialResolver {
+public:
+  unsigned resolve_count{0};
+  unsigned invalidate_count{0};
+
+  RGWCoroutine* resolve(rgw_owner, tc::Config, tc::Credentials*) override
+  {
+    ++resolve_count;
+    return new DelayedErrorCR(g_ceph_context, -EIO);
+  }
+
+  void invalidate(rgw_owner, const tc::Config&) override
+  {
+    ++invalidate_count;
   }
 };
 
@@ -233,6 +287,72 @@ TEST(RGWTenantCloudSync, ConstructsDataModuleWithInjectedProvider)
   EXPECT_NE(nullptr, module);
 }
 
+TEST(RGWTenantCloudSync, InvalidatesContextAndCredentialResolverTogether)
+{
+  auto resolver = std::make_shared<FakeCredentialResolver>();
+  auto provider = tc::make_resolving_target_context_provider(
+    resolver, 4, std::chrono::seconds{300});
+  ASSERT_TRUE(provider);
+  provider->invalidate(rgw_user{"tenant$user"}, "bucket-instance", config());
+  EXPECT_EQ(1u, resolver->invalidate_count);
+}
+
+TEST(RGWTenantCloudSync, CoalescesConcurrentResolutionFailure)
+{
+  const auto previous_allowlist = g_ceph_context->_conf.get_val<std::string>(
+    "rgw_tenant_cloud_endpoint_allowlist");
+  g_ceph_context->_conf.set_val_or_die(
+    "rgw_tenant_cloud_endpoint_allowlist", "s3.example.test");
+  g_ceph_context->_conf.apply_changes(nullptr);
+  struct AllowlistRestore {
+    std::string value;
+    ~AllowlistRestore() {
+      g_ceph_context->_conf.set_val_or_die(
+        "rgw_tenant_cloud_endpoint_allowlist", value);
+      g_ceph_context->_conf.apply_changes(nullptr);
+    }
+  } restore{previous_allowlist};
+
+  auto credential_resolver = std::make_shared<FakeCredentialResolver>();
+  auto provider = tc::make_resolving_target_context_provider(
+    credential_resolver, 4, std::chrono::seconds{300});
+  RGWDataSyncEnv env;
+  env.cct = g_ceph_context;
+  RGWDataSyncCtx sync;
+  sync.env = &env;
+  sync.cct = g_ceph_context;
+  tc::TargetContextRef first_result;
+  tc::TargetContextRef second_result;
+  auto cfg = config();
+  auto* first = provider->resolve(nullptr, &sync, rgw_user{"tenant$user"},
+                                  "bucket-instance", cfg, &first_result);
+  auto* second = provider->resolve(nullptr, &sync, rgw_user{"tenant$user"},
+                                   "bucket-instance", cfg, &second_result);
+  ASSERT_NE(nullptr, first);
+  ASSERT_NE(nullptr, second);
+
+  RGWCoroutinesManager manager(g_ceph_context, nullptr);
+  std::list<RGWCoroutinesStack*> stacks;
+  first->get();
+  auto* first_stack = manager.allocate_stack();
+  first_stack->call(first);
+  stacks.push_back(first_stack);
+  second->get();
+  auto* second_stack = manager.allocate_stack();
+  second_stack->call(second);
+  stacks.push_back(second_stack);
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  manager.run(&dpp, stacks);
+
+  EXPECT_EQ(-EIO, first->get_ret_status());
+  EXPECT_EQ(-EIO, second->get_ret_status());
+  EXPECT_EQ(1u, credential_resolver->resolve_count);
+  EXPECT_FALSE(first_result);
+  EXPECT_FALSE(second_result);
+  first->put();
+  second->put();
+}
+
 TEST(RGWTenantCloudSync, BuildsStrictTargetContextFromCredentials)
 {
   auto cfg = config();
@@ -241,15 +361,33 @@ TEST(RGWTenantCloudSync, BuildsStrictTargetContextFromCredentials)
   credentials.access_key_id = "temporary-access";
   credentials.secret_key = "temporary-secret";
   credentials.session_token = "temporary-session";
+  credentials.cache_expires_at = 2000000000;
 
   tc::TargetContextRef context;
-  ASSERT_EQ(0, tc::build_target_context(
-                 g_ceph_context, rgw_user{"tenant$user"},
-                 "bucket-instance", "source-zonegroup", cfg, credentials,
-                 &context));
+  const auto previous_allowlist = g_ceph_context->_conf.get_val<std::string>(
+    "rgw_tenant_cloud_endpoint_allowlist");
+  g_ceph_context->_conf.set_val_or_die(
+    "rgw_tenant_cloud_endpoint_allowlist", "");
+  g_ceph_context->_conf.apply_changes(nullptr);
+  EXPECT_EQ(-EINVAL, tc::build_target_context(
+                g_ceph_context, rgw_user{"tenant$user"},
+                "bucket-instance", "source-zonegroup", cfg, credentials,
+                &context));
+  g_ceph_context->_conf.set_val_or_die(
+    "rgw_tenant_cloud_endpoint_allowlist", "s3.example.test");
+  g_ceph_context->_conf.apply_changes(nullptr);
+  const int result = tc::build_target_context(
+    g_ceph_context, rgw_user{"tenant$user"}, "bucket-instance",
+    "source-zonegroup", cfg, credentials, &context);
+  g_ceph_context->_conf.set_val_or_die(
+    "rgw_tenant_cloud_endpoint_allowlist", previous_allowlist);
+  g_ceph_context->_conf.apply_changes(nullptr);
+  ASSERT_EQ(0, result);
   ASSERT_TRUE(context);
   EXPECT_EQ(cfg.target_zone_id, context->target_zone_id);
   EXPECT_EQ(cfg.credential_ref, context->credential_ref);
+  EXPECT_EQ(credentials.cache_expires_at,
+            context->credentials_refresh_at);
   EXPECT_NE(nullptr, context->target);
 }
 
@@ -260,11 +398,13 @@ TEST(RGWTenantCloudSync, CredentialCacheIsOwnerScopedAndBounded)
   first.version = 1;
   first.access_key_id = "first";
   first.secret_key = "secret";
-  cache.put("owner-a:cred", first);
+  const auto first_expiry = cache.put("owner-a:cred", first);
+  ASSERT_TRUE(first_expiry);
 
   tc::Credentials actual;
   ASSERT_TRUE(cache.get("owner-a:cred", &actual));
   EXPECT_EQ("first", actual.access_key_id);
+  EXPECT_EQ(first_expiry, actual.cache_expires_at);
   EXPECT_FALSE(cache.get("owner-b:cred", &actual));
 
   tc::Credentials second = first;
@@ -286,6 +426,38 @@ TEST(RGWTenantCloudSync, CredentialCacheRefreshesBeforeProviderExpiry)
     std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()) + 10);
   cache.put("owner:cred", credentials);
   EXPECT_FALSE(cache.get("owner:cred", &credentials));
+}
+
+TEST(RGWTenantCloudSync, CredentialCacheInvalidatesRotatedCredentials)
+{
+  tc::CredentialCache cache(4, std::chrono::seconds{300});
+  tc::Credentials credentials;
+  credentials.version = 1;
+  credentials.access_key_id = "stale";
+  credentials.secret_key = "secret";
+  const auto generation = cache.get_generation("owner:cred");
+  cache.put("owner:cred", credentials);
+  cache.invalidate("owner:cred");
+  EXPECT_FALSE(cache.generation_is_current("owner:cred", generation));
+  EXPECT_FALSE(cache.get("owner:cred", &credentials));
+  EXPECT_FALSE(cache.put("owner:cred", credentials, &generation));
+  EXPECT_FALSE(cache.get("owner:cred", &credentials));
+}
+
+TEST(RGWTenantCloudSync, CredentialCacheInvalidationIsKeyScoped)
+{
+  tc::CredentialCache cache(4, std::chrono::seconds{300});
+  tc::Credentials credentials;
+  credentials.version = 1;
+  credentials.access_key_id = "access";
+  credentials.secret_key = "secret";
+
+  const auto first_generation = cache.get_generation("owner-a:cred");
+  const auto second_generation = cache.get_generation("owner-b:cred");
+  cache.invalidate("owner-a:cred");
+
+  EXPECT_FALSE(cache.put("owner-a:cred", credentials, &first_generation));
+  EXPECT_TRUE(cache.put("owner-b:cred", credentials, &second_generation));
 }
 
 TEST(RGWTenantCloudSync, RunsInjectedProviderDeleteCoroutine)
@@ -312,6 +484,59 @@ TEST(RGWTenantCloudSync, RunsInjectedProviderDeleteCoroutine)
   EXPECT_EQ(0, manager.run(&dpp, operation));
   EXPECT_EQ(1u, provider->resolve_count);
   EXPECT_TRUE(provider->target->delete_called);
+}
+
+TEST(RGWTenantCloudSync, RefreshesCredentialsOnceAfterDeleteAuthFailure)
+{
+  auto provider = std::make_shared<FakeProvider>();
+  provider->target->delete_result = -EACCES;
+  provider->target->delete_status = 403;
+  provider->recover_on_invalidate = true;
+  auto module = tc::make_data_sync_module(provider);
+
+  RGWDataSyncEnv env;
+  env.cct = g_ceph_context;
+  RGWDataSyncCtx sync;
+  sync.env = &env;
+  sync.cct = g_ceph_context;
+  sync.source_zone = rgw_zone_id{"source-zone"};
+  auto pipe = sync_pipe();
+  rgw_obj_key key{"object"};
+  real_time mtime;
+  auto* operation = module->remove_object(nullptr, &sync, pipe, key, mtime,
+                                          false, 0, nullptr);
+  RGWCoroutinesManager manager(g_ceph_context, nullptr);
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(0, manager.run(&dpp, operation));
+  EXPECT_EQ(2u, provider->resolve_count);
+  EXPECT_EQ(1u, provider->invalidate_count);
+  EXPECT_EQ(2u, provider->target->delete_count);
+}
+
+TEST(RGWTenantCloudSync, StopsAfterSecondDeleteAuthFailure)
+{
+  auto provider = std::make_shared<FakeProvider>();
+  provider->target->delete_result = -EACCES;
+  provider->target->delete_status = 401;
+  auto module = tc::make_data_sync_module(provider);
+
+  RGWDataSyncEnv env;
+  env.cct = g_ceph_context;
+  RGWDataSyncCtx sync;
+  sync.env = &env;
+  sync.cct = g_ceph_context;
+  sync.source_zone = rgw_zone_id{"source-zone"};
+  auto pipe = sync_pipe();
+  rgw_obj_key key{"object"};
+  real_time mtime;
+  auto* operation = module->remove_object(nullptr, &sync, pipe, key, mtime,
+                                          false, 0, nullptr);
+  RGWCoroutinesManager manager(g_ceph_context, nullptr);
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(-EIO, manager.run(&dpp, operation));
+  EXPECT_EQ(2u, provider->resolve_count);
+  EXPECT_EQ(1u, provider->invalidate_count);
+  EXPECT_EQ(2u, provider->target->delete_count);
 }
 
 TEST(RGWTenantCloudSync, PreservesNonIgnoredProviderFailure)
@@ -510,3 +735,5 @@ TEST(RGWTenantCloudSync, RejectsMixedPutPipeBeforeRemoteStat)
 }
 
 } // anonymous namespace
+
+#include <boost/asio/unyield.hpp>

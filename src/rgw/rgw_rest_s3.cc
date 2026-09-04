@@ -1515,6 +1515,11 @@ struct ReplicationConfiguration {
         if (ret < 0) {
           return ret;
         }
+        ret = rgw::tenant_cloud::validate_endpoint_policy(
+          s->cct, config, &s->err.message);
+        if (ret < 0) {
+          return ret;
+        }
         *tenant_cloud_config = std::move(config);
 
         // RGWSyncBucketCR requires a real Ceph bucket on both sides. The
@@ -1833,6 +1838,10 @@ void RGWPutBucketReplication_ObjStore_S3::send_response()
 {
   if (op_ret)
     set_req_state_err(s, op_ret);
+  if (tenant_cloud_master_result) {
+    dump_header(s, "x-rgw-tenant-cloud-state",
+                *tenant_cloud_master_result ? "1" : "0");
+  }
   dump_errno(s);
   end_header(s, this, to_mime_type(s->format));
   dump_start(s);
@@ -1848,6 +1857,10 @@ void RGWDeleteBucketReplication_ObjStore_S3::send_response()
 {
   if (op_ret)
     set_req_state_err(s, op_ret);
+  if (tenant_cloud_master_result) {
+    dump_header(s, "x-rgw-tenant-cloud-state",
+                *tenant_cloud_master_result ? "1" : "0");
+  }
   dump_errno(s);
   end_header(s, this, to_mime_type(s->format));
   dump_start(s);

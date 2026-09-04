@@ -41,10 +41,12 @@ public:
 
   RGWCoroutine* delete_object(CephContext* cct,
                               RGWHTTPManager* http_manager,
-                              std::string path, bool* not_found) override
+                              std::string path, bool* not_found,
+                              int* http_status) override
   {
     return new RGWDeleteRESTResourceCR(cct, conn.get(), http_manager,
-                                       std::move(path), nullptr, not_found);
+                                       std::move(path), nullptr, not_found,
+                                       http_status);
   }
 };
 
@@ -157,15 +159,18 @@ class DeleteCR final : public RGWCoroutine {
   RGWHTTPManager* http_manager;
   std::string path;
   bool not_found{false};
+  int http_status{0};
+  int* http_status_out{nullptr};
   std::unique_ptr<RGWCoroutine> operation;
 
 public:
   DeleteCR(CephContext* cct, std::shared_ptr<Target> target,
-           RGWHTTPManager* http_manager, std::string path)
+           RGWHTTPManager* http_manager, std::string path,
+           int* http_status_out)
     : RGWCoroutine(cct),
       target(std::move(target)),
       http_manager(http_manager),
-      path(std::move(path))
+      path(std::move(path)), http_status_out(http_status_out)
   {
   }
 
@@ -176,12 +181,16 @@ public:
         return set_cr_error(-EINVAL);
       }
       operation.reset(target->delete_object(cct, http_manager,
-                                            std::move(path), &not_found));
+                                            std::move(path), &not_found,
+                                            &http_status));
       if (!operation) {
         return set_cr_error(-EINVAL);
       }
       yield call(operation.release());
       retcode = normalize_delete_result(retcode, not_found);
+      if (http_status_out) {
+        *http_status_out = http_status;
+      }
       if (retcode < 0) {
         return set_cr_error(retcode);
       }
@@ -262,9 +271,10 @@ void StreamPutCRF::send_ready(const DoutPrefixProvider* dpp,
 RGWCoroutine* delete_object(CephContext* cct,
                             std::shared_ptr<Target> target,
                             RGWHTTPManager* http_manager,
-                            std::string path)
+                            std::string path, int* http_status)
 {
-  return new DeleteCR(cct, std::move(target), http_manager, std::move(path));
+  return new DeleteCR(cct, std::move(target), http_manager,
+                      std::move(path), http_status);
 }
 
 int normalize_delete_result(int result, bool remote_not_found)

@@ -2,7 +2,6 @@
 // vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include <cerrno>
-#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -159,25 +158,36 @@ TEST(RGWTenantCloud, rejects_unassigned_stored_generation)
   EXPECT_FALSE(config);
 }
 
-TEST(RGWTenantCloud, advances_config_generation)
+TEST(RGWTenantCloud, assignsStableGenerationToImmutableConfig)
 {
   auto previous = valid_config();
   previous.config_generation = 7;
 
   auto next = previous;
+  ASSERT_EQ(0, tc::advance_generation(previous, 7, &next));
+  EXPECT_EQ(7, next.config_generation);
+  EXPECT_EQ(-EINVAL, tc::advance_generation(previous, 7, nullptr));
+
   next.credential_ref = "vault://backup-rotated";
-  ASSERT_EQ(0, tc::advance_generation(previous, &next));
+  EXPECT_EQ(-EOPNOTSUPP, tc::advance_generation(previous, 7, &next));
+
+  next = valid_config();
+  EXPECT_EQ(0, tc::advance_generation(std::nullopt, 7, &next));
   EXPECT_EQ(8, next.config_generation);
-  EXPECT_EQ(-EINVAL, tc::advance_generation(previous, nullptr));
 }
 
-TEST(RGWTenantCloud, rejects_generation_overflow)
+TEST(RGWTenantCloud, preservesGenerationAcrossDeleteAndRecreate)
 {
-  auto previous = valid_config();
-  previous.config_generation = std::numeric_limits<uint64_t>::max();
-  auto next = previous;
-  EXPECT_EQ(-EOVERFLOW,
-            tc::advance_generation(previous, &next));
+  tc::Attrs attrs;
+  tc::encode_epoch(12, &attrs);
+
+  uint64_t epoch = 0;
+  ASSERT_EQ(0, tc::decode_epoch(attrs, &epoch));
+  EXPECT_EQ(12u, epoch);
+
+  auto recreated = valid_config();
+  ASSERT_EQ(0, tc::advance_generation(std::nullopt, epoch, &recreated));
+  EXPECT_EQ(13u, recreated.config_generation);
 }
 
 TEST(RGWTenantCloud, parses_versioned_credentials)

@@ -12,6 +12,7 @@ using namespace std;
 
 static constexpr const char* EP1 = "http://127.0.0.1:8000";
 static constexpr const char* EP2 = "http://127.0.0.2:8000";
+static constexpr const char* PUBLIC_EP = "https://93.184.216.34";
 
 static RGWRESTConn make_conn(const list<string>& endpoints)
 {
@@ -56,6 +57,15 @@ TEST(RGWRESTConn, get_endpoint_when_all_ips_are_down)
   EXPECT_TRUE(ep.get_connect_to().empty());
 }
 
+TEST(RGWRESTConn, require_pinned_preserves_prohibited_address_rejection)
+{
+  RGWRESTConn conn(g_ceph_context, "remote-zone", {EP1},
+                   RGWAccessKey("access", "secret"), "zonegroup", nullopt,
+                   PathStyle, RGWEndpointSelectionPolicy::require_pinned);
+  RGWEndpoint ep;
+  EXPECT_EQ(-EHOSTUNREACH, conn.get_endpoint(ep));
+}
+
 TEST(RGWRESTConn, outbound_credentials_are_retained)
 {
   RGWOutboundCredentials credentials("temporary-access", "temporary-secret",
@@ -96,29 +106,45 @@ TEST(RGWRESTConn, temporary_credentials_fail_before_sigv2_send)
   g_ceph_context->_conf.apply_changes(nullptr);
 }
 
-TEST(RGWRESTConn, strict_policy_rejects_prohibited_addresses)
+TEST(RGWRESTConn, strict_policy_pins_to_approved_address)
+{
+  RGWRESTConn conn(g_ceph_context, "remote-zone", {PUBLIC_EP},
+                   RGWAccessKey("access", "secret"), "zonegroup", nullopt,
+                   PathStyle, RGWEndpointSelectionPolicy::require_pinned,
+                   RGWEndpointAddressPolicy::reject_prohibited);
+  RGWEndpoint endpoint;
+  EXPECT_EQ(0, conn.get_endpoint(endpoint));
+  EXPECT_FALSE(endpoint.get_connect_to().empty());
+  EXPECT_EQ(RGWEndpointAddressPolicy::reject_prohibited,
+            endpoint.get_address_policy());
+}
+
+TEST(RGWRESTConn, strict_policy_rejects_prohibited_address)
 {
   RGWRESTConn conn(g_ceph_context, "remote-zone", {EP1},
                    RGWAccessKey("access", "secret"), "zonegroup", nullopt,
-                   PathStyle, RGWEndpointSelectionPolicy::require_pinned);
+                   PathStyle, RGWEndpointSelectionPolicy::require_pinned,
+                   RGWEndpointAddressPolicy::reject_prohibited);
   RGWEndpoint endpoint;
   EXPECT_EQ(-EHOSTUNREACH, conn.get_endpoint(endpoint));
 }
 
-TEST(RGWRESTConn, strict_policy_always_pins_approved_addresses)
+TEST(RGWRESTConn, strict_policy_resolves_and_pins_literal)
 {
   g_ceph_context->_conf.set_val_or_die(
     "rgw_rest_conn_connect_to_resolved_ips", "false");
   g_ceph_context->_conf.apply_changes(nullptr);
 
   RGWRESTConn conn(g_ceph_context, "remote-zone",
-                   {"https://93.184.216.34"},
+                   {PUBLIC_EP},
                    RGWAccessKey("access", "secret"), "zonegroup",
                    std::nullopt, PathStyle,
-                   RGWEndpointSelectionPolicy::require_pinned);
+                   RGWEndpointSelectionPolicy::require_pinned,
+                   RGWEndpointAddressPolicy::reject_prohibited);
   RGWEndpoint endpoint;
   EXPECT_EQ(0, conn.get_endpoint(endpoint));
   EXPECT_FALSE(endpoint.get_connect_to().empty());
+  EXPECT_FALSE(conn.get_resolved_endpoints().front().resolved_ips.empty());
 
   g_ceph_context->_conf.set_val_or_die(
     "rgw_rest_conn_connect_to_resolved_ips", "true");

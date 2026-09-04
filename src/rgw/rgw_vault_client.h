@@ -35,7 +35,9 @@ public:
   int request(const DoutPrefixProvider* dpp, const char* method,
               std::string_view path, const std::string& postdata,
               optional_yield y, bufferlist& response) const;
+#ifdef WITH_RADOSGW_RADOS
   RGWCoroutine* request_async(const char* method, std::string_view path,
                               std::string postdata,
                               bufferlist* response) const;
+#endif
 };

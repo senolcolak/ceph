@@ -78,7 +78,8 @@ void RGWRESTConn::resolve_endpoints() {
 
       res_ep.resolved_ips.reserve(results.size());
       for (const auto& entry : results) {
-        if (endpoint_policy == RGWEndpointSelectionPolicy::require_pinned &&
+        if ((endpoint_selection_policy == RGWEndpointSelectionPolicy::require_pinned ||
+             endpoint_address_policy == RGWEndpointAddressPolicy::reject_prohibited) &&
             rgw::secure_endpoint::is_prohibited_address(entry.endpoint().address())) {
           continue;
         }
@@ -100,12 +101,14 @@ RGWRESTConn::RGWRESTConn(CephContext *_cct, rgw::sal::Driver* driver,
                          const list<string>& remote_endpoints,
                          std::optional<string> _api_name,
                          HostStyle _host_style,
-                         RGWEndpointSelectionPolicy _endpoint_policy)
+                         RGWEndpointSelectionPolicy _endpoint_policy,
+                         RGWEndpointAddressPolicy _address_policy)
   : cct(_cct),
     remote_id(_remote_id),
     api_name(_api_name),
     host_style(_host_style),
-    endpoint_policy(_endpoint_policy)
+    endpoint_selection_policy(_endpoint_policy),
+    endpoint_address_policy(_address_policy)
 {
   resolved_endpoints.reserve(remote_endpoints.size());
   for (const auto& ep_url : remote_endpoints) {
@@ -129,7 +132,8 @@ RGWRESTConn::RGWRESTConn(CephContext *_cct,
                          std::string _zone_group,
                          std::optional<string> _api_name,
                          HostStyle _host_style,
-                         RGWEndpointSelectionPolicy _endpoint_policy)
+                         RGWEndpointSelectionPolicy _endpoint_policy,
+                         RGWEndpointAddressPolicy _address_policy)
   : cct(_cct),
     key(_cred),
     credentials(_cred),
@@ -137,7 +141,8 @@ RGWRESTConn::RGWRESTConn(CephContext *_cct,
     remote_id(_remote_id),
     api_name(_api_name),
     host_style(_host_style),
-    endpoint_policy(_endpoint_policy)
+    endpoint_selection_policy(_endpoint_policy),
+    endpoint_address_policy(_address_policy)
 {
   resolved_endpoints.reserve(remote_endpoints.size());
   for (const auto& ep_url : remote_endpoints) {
@@ -155,7 +160,8 @@ RGWRESTConn::RGWRESTConn(CephContext *_cct,
                          std::string _zone_group,
                          std::optional<string> _api_name,
                          HostStyle _host_style,
-                         RGWEndpointSelectionPolicy _endpoint_policy)
+                         RGWEndpointSelectionPolicy _endpoint_policy,
+                         RGWEndpointAddressPolicy _address_policy)
   : cct(_cct),
     key(_cred.access_key_id, _cred.secret_key),
     credentials(std::move(_cred)),
@@ -163,7 +169,8 @@ RGWRESTConn::RGWRESTConn(CephContext *_cct,
     remote_id(_remote_id),
     api_name(_api_name),
     host_style(_host_style),
-    endpoint_policy(_endpoint_policy)
+    endpoint_selection_policy(_endpoint_policy),
+    endpoint_address_policy(_address_policy)
 {
   resolved_endpoints.reserve(remote_endpoints.size());
   for (const auto& ep_url : remote_endpoints) {
@@ -185,7 +192,8 @@ RGWRESTConn::RGWRESTConn(RGWRESTConn&& other)
     remote_id(std::move(other.remote_id)),
     api_name(std::move(other.api_name)),
     host_style(other.host_style),
-    endpoint_policy(other.endpoint_policy)
+    endpoint_selection_policy(other.endpoint_selection_policy),
+    endpoint_address_policy(other.endpoint_address_policy)
 {
 }
 
@@ -197,7 +205,8 @@ RGWRESTConn& RGWRESTConn::operator=(RGWRESTConn&& other)
   resolved_endpoints = std::move(other.resolved_endpoints);
   key = std::move(other.key);
   credentials = std::move(other.credentials);
-  endpoint_policy = other.endpoint_policy;
+  endpoint_selection_policy = other.endpoint_selection_policy;
+  endpoint_address_policy = other.endpoint_address_policy;
   self_zone_group = std::move(other.self_zone_group);
   remote_id = std::move(other.remote_id);
   api_name = std::move(other.api_name);
@@ -218,7 +227,7 @@ ResolvedEndpoint* RGWRESTConn::find_resolved_endpoint(const std::string& url)
 void RGWRESTConn::populate_connect_to(RGWEndpoint& endpoint, ResolvedEndpoint& resolved_endpoint)
 {
   if (!cct->_conf->rgw_rest_conn_connect_to_resolved_ips &&
-      endpoint_policy == RGWEndpointSelectionPolicy::allow_fallback) {
+      endpoint_selection_policy == RGWEndpointSelectionPolicy::allow_fallback) {
     return;
   }
 
@@ -259,8 +268,9 @@ void RGWRESTConn::populate_connect_to(RGWEndpoint& endpoint, ResolvedEndpoint& r
 
 int RGWRESTConn::get_endpoint(RGWEndpoint& endpoint)
 {
+  endpoint.set_address_policy(endpoint_address_policy);
   const bool allow_fallback =
-    endpoint_policy == RGWEndpointSelectionPolicy::allow_fallback;
+    endpoint_selection_policy == RGWEndpointSelectionPolicy::allow_fallback;
   // A reused endpoint may carry a pin from a previous selection. Clear it
   // before selecting a new URL so fallback cannot retain a stale mapping.
   endpoint.set_connect_to("");
@@ -274,8 +284,6 @@ int RGWRESTConn::get_endpoint(RGWEndpoint& endpoint)
 
   // Helper to check if an endpoint has at least one available IP
   auto endpoint_has_available_ip = [&](ResolvedEndpoint& res_ep) -> bool {
-    // Ordinary callers may fall back to DNS. Strict callers must have at
-    // least one approved resolved address.
     if (res_ep.resolved_ips.empty()) {
       return allow_fallback;
     }
@@ -396,7 +404,8 @@ void RGWRESTConn::populate_params(param_vec_t& params, const rgw_owner* uid, con
 
 auto RGWRESTConn::forward(const DoutPrefixProvider *dpp, const rgw_owner& uid,
                           const req_info& info, size_t max_response,
-                          bufferlist *inbl, bufferlist *outbl, optional_yield y)
+                          bufferlist *inbl, bufferlist *outbl, optional_yield y,
+                          std::map<std::string, std::string>* response_headers)
   -> tl::expected<int, int>
 {
   static constexpr int NUM_ENPOINT_IOERROR_RETRIES = 20;
@@ -412,6 +421,9 @@ auto RGWRESTConn::forward(const DoutPrefixProvider *dpp, const rgw_owner& uid,
     RGWRESTSimpleRequest req(cct, info.method, endpoint, NULL, &params, api_name);
     auto result = req.forward_request(dpp, key, info, max_response, inbl, outbl, y);
     if (result) {
+      if (response_headers) {
+        req.get_out_headers(response_headers);
+      }
       return result;
     } else if (result.error() != -ERR_SERVICE_UNAVAILABLE) {
       return result;

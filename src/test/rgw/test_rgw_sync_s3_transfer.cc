@@ -28,14 +28,16 @@ public:
 class FakeTarget final : public s3::Target {
 public:
   int put_result{-ECONNREFUSED};
+  RGWRESTStreamS3PutObj* put_request{nullptr};
   bool delete_called{false};
   std::string deleted_path;
   int delete_result{0};
+  int delete_status{0};
   bool delete_not_found{false};
 
   int init_put(const rgw_obj&, RGWRESTStreamS3PutObj** request) override
   {
-    *request = nullptr;
+    *request = put_request;
     return put_result;
   }
 
@@ -46,12 +48,16 @@ public:
   }
 
   RGWCoroutine* delete_object(CephContext* cct, RGWHTTPManager*,
-                              std::string path, bool* not_found) override
+                              std::string path, bool* not_found,
+                              int* http_status) override
   {
     delete_called = true;
     deleted_path = std::move(path);
     if (not_found) {
       *not_found = delete_not_found;
+    }
+    if (http_status) {
+      *http_status = delete_status;
     }
     return new DoneCR(cct, delete_result);
   }
@@ -140,6 +146,20 @@ TEST(RGWSyncS3Transfer, RunsDeleteCoroutineAndPropagatesResult)
   EXPECT_EQ(0, manager.run(&dpp, operation));
   EXPECT_TRUE(target->delete_called);
   EXPECT_EQ("bucket/key", target->deleted_path);
+}
+
+TEST(RGWSyncS3Transfer, PropagatesDeleteHTTPStatus)
+{
+  auto target = std::make_shared<FakeTarget>();
+  target->delete_result = -EACCES;
+  target->delete_status = 403;
+  int status = 0;
+  auto* operation = s3::delete_object(g_ceph_context, target, nullptr,
+                                      "bucket/key", &status);
+  RGWCoroutinesManager manager(g_ceph_context, nullptr);
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(-EACCES, manager.run(&dpp, operation));
+  EXPECT_EQ(403, status);
 }
 
 TEST(RGWSyncS3Transfer, OnlyConfirmedNotFoundIsIdempotent)
