@@ -779,10 +779,17 @@ int RadosBucket::chown(const DoutPrefixProvider* dpp,
   return put_info(dpp, exclusive, ceph::real_clock::now(), y);
 }
 
-int RadosBucket::put_info(const DoutPrefixProvider* dpp, bool exclusive, ceph::real_time _mtime, optional_yield y)
+int RadosBucket::put_info_with_activation(const DoutPrefixProvider* dpp, bool exclusive, ceph::real_time _mtime, optional_yield y, bool tenant_cloud_activation)
 {
   mtime = _mtime;
-  return store->getRados()->put_bucket_instance_info(info, exclusive, mtime, &attrs, dpp, y);
+  return store->getRados()->put_bucket_instance_info(
+    info, exclusive, mtime, &attrs, dpp, y, tenant_cloud_activation);
+}
+
+int RadosBucket::put_info(const DoutPrefixProvider* dpp, bool exclusive,
+                          ceph::real_time _mtime, optional_yield y)
+{
+  return put_info_with_activation(dpp, exclusive, _mtime, y, false);
 }
 
 int RadosBucket::check_empty(const DoutPrefixProvider* dpp, optional_yield y)

@@ -12,6 +12,7 @@ using namespace std;
 
 static constexpr const char* EP1 = "http://127.0.0.1:8000";
 static constexpr const char* EP2 = "http://127.0.0.2:8000";
+static constexpr const char* PUBLIC_EP = "https://93.184.216.34";
 
 static RGWRESTConn make_conn(const list<string>& endpoints)
 {
@@ -54,6 +55,100 @@ TEST(RGWRESTConn, get_endpoint_when_all_ips_are_down)
   EXPECT_FALSE(ep.get_url().empty());
   // no connect_to hint:
   EXPECT_TRUE(ep.get_connect_to().empty());
+}
+
+TEST(RGWRESTConn, require_pinned_preserves_prohibited_address_rejection)
+{
+  RGWRESTConn conn(g_ceph_context, "remote-zone", {EP1},
+                   RGWAccessKey("access", "secret"), "zonegroup", nullopt,
+                   PathStyle, RGWEndpointSelectionPolicy::require_pinned);
+  RGWEndpoint ep;
+  EXPECT_EQ(-EHOSTUNREACH, conn.get_endpoint(ep));
+}
+
+TEST(RGWRESTConn, outbound_credentials_are_retained)
+{
+  RGWOutboundCredentials credentials("temporary-access", "temporary-secret",
+                                     std::string("temporary-session"));
+  RGWRESTConn conn(g_ceph_context, "remote-zone", {EP1},
+                   credentials, "zonegroup", nullopt);
+
+  EXPECT_EQ(credentials.access_key_id, conn.get_credentials().access_key_id);
+  EXPECT_EQ(credentials.secret_key, conn.get_credentials().secret_key);
+  ASSERT_TRUE(conn.get_credentials().session_token);
+  EXPECT_EQ("temporary-session", *conn.get_credentials().session_token);
+  EXPECT_EQ(credentials.access_key_id, conn.get_key().id);
+  EXPECT_EQ(credentials.secret_key, conn.get_key().key);
+}
+
+TEST(RGWRESTConn, temporary_credentials_fail_before_sigv2_send)
+{
+  const auto previous =
+    g_ceph_context->_conf.get_val<int64_t>("rgw_s3_client_max_sig_ver");
+  g_ceph_context->_conf.set_val_or_die("rgw_s3_client_max_sig_ver", "2");
+  g_ceph_context->_conf.apply_changes(nullptr);
+
+  RGWEndpoint endpoint;
+  endpoint.set_url(EP1);
+  RGWRESTStreamS3PutObj request(g_ceph_context, "PUT", endpoint, nullptr,
+                                nullptr, std::nullopt, PathStyle);
+  rgw_obj object;
+  object.bucket.name = "bucket";
+  object.key.set("object");
+  request.send_init(object);
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  request.send_ready(
+    &dpp, RGWOutboundCredentials{"access", "secret", "session"});
+  EXPECT_EQ(-EOPNOTSUPP, request.send(nullptr));
+
+  g_ceph_context->_conf.set_val_or_die(
+    "rgw_s3_client_max_sig_ver", std::to_string(previous));
+  g_ceph_context->_conf.apply_changes(nullptr);
+}
+
+TEST(RGWRESTConn, strict_policy_pins_to_approved_address)
+{
+  RGWRESTConn conn(g_ceph_context, "remote-zone", {PUBLIC_EP},
+                   RGWAccessKey("access", "secret"), "zonegroup", nullopt,
+                   PathStyle, RGWEndpointSelectionPolicy::require_pinned,
+                   RGWEndpointAddressPolicy::reject_prohibited);
+  RGWEndpoint endpoint;
+  EXPECT_EQ(0, conn.get_endpoint(endpoint));
+  EXPECT_FALSE(endpoint.get_connect_to().empty());
+  EXPECT_EQ(RGWEndpointAddressPolicy::reject_prohibited,
+            endpoint.get_address_policy());
+}
+
+TEST(RGWRESTConn, strict_policy_rejects_prohibited_address)
+{
+  RGWRESTConn conn(g_ceph_context, "remote-zone", {EP1},
+                   RGWAccessKey("access", "secret"), "zonegroup", nullopt,
+                   PathStyle, RGWEndpointSelectionPolicy::require_pinned,
+                   RGWEndpointAddressPolicy::reject_prohibited);
+  RGWEndpoint endpoint;
+  EXPECT_EQ(-EHOSTUNREACH, conn.get_endpoint(endpoint));
+}
+
+TEST(RGWRESTConn, strict_policy_resolves_and_pins_literal)
+{
+  g_ceph_context->_conf.set_val_or_die(
+    "rgw_rest_conn_connect_to_resolved_ips", "false");
+  g_ceph_context->_conf.apply_changes(nullptr);
+
+  RGWRESTConn conn(g_ceph_context, "remote-zone",
+                   {PUBLIC_EP},
+                   RGWAccessKey("access", "secret"), "zonegroup",
+                   std::nullopt, PathStyle,
+                   RGWEndpointSelectionPolicy::require_pinned,
+                   RGWEndpointAddressPolicy::reject_prohibited);
+  RGWEndpoint endpoint;
+  EXPECT_EQ(0, conn.get_endpoint(endpoint));
+  EXPECT_FALSE(endpoint.get_connect_to().empty());
+  EXPECT_FALSE(conn.get_resolved_endpoints().front().resolved_ips.empty());
+
+  g_ceph_context->_conf.set_val_or_die(
+    "rgw_rest_conn_connect_to_resolved_ips", "true");
+  g_ceph_context->_conf.apply_changes(nullptr);
 }
 
 int main(int argc, char** argv)

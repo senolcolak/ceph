@@ -434,7 +434,8 @@ int RGWSI_Bucket_SObj::store_bucket_instance_info(const string& key,
                                                   real_time mtime,
                                                   const map<string, bufferlist> *pattrs,
                                                   optional_yield y,
-                                                  const DoutPrefixProvider *dpp)
+                                                  const DoutPrefixProvider *dpp,
+                                                  bool tenant_cloud_activation)
 {
   bufferlist bl;
   encode(info, bl);
@@ -475,16 +476,44 @@ int RGWSI_Bucket_SObj::store_bucket_instance_info(const string& key,
   int ret = rgw_put_system_obj(dpp, svc.sysobj, pool, oid, bl, exclusive,
                                &info.objv_tracker, mtime, y, pattrs);
   if (ret >= 0) {
-    int r = svc.mdlog->complete_entry(dpp, y, "bucket.instance",
-                                      key, &info.objv_tracker);
-    if (r < 0) {
-      return r;
+    int r;
+    if (tenant_cloud_activation) {
+      // Publish the new policy before emitting activation. A worker may
+      // consume the signal immediately and must discover the new pipe.
+      r = svc.bucket_sync->handle_bi_update(
+        dpp, info, orig_info.value_or(nullptr), y);
+      if (r < 0) {
+        return r;
+      }
+      // The metadata object is durable before the data-log signal is emitted.
+      // Keep the metadata-log entry incomplete until activation succeeds so a
+      // failed operation retains its existing metadata retry ownership.
+      // A replicated bucket may be new in this zone, so there is no
+      // previous RGWBucketInfo to pass. The activation helper only needs the
+      // new policy and uses the old value for API symmetry; use the new info
+      // as a harmless placeholder in that case.
+      const RGWBucketInfo& activation_orig =
+        (orig_info && *orig_info) ? **orig_info : info;
+      r = svc.bi->handle_sync_policy_update(
+        dpp, info, activation_orig, tenant_cloud_activation, y);
+      if (r < 0) {
+        return r;
+      }
     }
 
-    r = svc.bucket_sync->handle_bi_update(dpp, info, orig_info.value_or(nullptr), y);
+    r = svc.mdlog->complete_entry(dpp, y, "bucket.instance",
+                                  key, &info.objv_tracker);
     if (r < 0) {
       return r;
     }
+    if (!tenant_cloud_activation) {
+      r = svc.bucket_sync->handle_bi_update(
+        dpp, info, orig_info.value_or(nullptr), y);
+      if (r < 0) {
+        return r;
+      }
+    }
+
   } else if (ret == -EEXIST) {
     /* well, if it's exclusive we shouldn't overwrite it, because we might race with another
      * bucket operation on this specific bucket (e.g., being synced from the master), but

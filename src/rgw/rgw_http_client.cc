@@ -2,6 +2,7 @@
 // vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include "include/compat.h"
+#include "include/sock_compat.h"
 #include "common/errno.h"
 
 
@@ -13,6 +14,7 @@
 #include "rgw_common.h"
 #include "rgw_http_client.h"
 #include "rgw_http_errors.h"
+#include "rgw_secure_endpoint_resolver.h"
 #include "common/async/completion.h"
 #include "common/RefCountedObj.h"
 
@@ -25,6 +27,27 @@
 #define dout_subsys ceph_subsys_rgw
 
 using namespace std;
+
+namespace {
+
+bool supports_async_dns()
+{
+  const auto* version = curl_version_info(CURLVERSION_NOW);
+  return version && (version->features & CURL_VERSION_ASYNCHDNS);
+}
+
+curl_socket_t open_public_socket(void*, curlsocktype purpose,
+                                 curl_sockaddr* address)
+{
+  if (purpose != CURLSOCKTYPE_IPCXN || !address ||
+      rgw::secure_endpoint::is_prohibited_sockaddr(
+        &address->addr, address->addrlen)) {
+    return CURL_SOCKET_BAD;
+  }
+  return socket_cloexec(address->family, address->socktype, address->protocol);
+}
+
+} // anonymous namespace
 
 RGWHTTPManager *rgw_http_manager;
 
@@ -603,6 +626,24 @@ int RGWHTTPClient::init_request(rgw_http_req_data *_req_data)
   curl_easy_setopt(easy_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
   curl_easy_setopt(easy_handle, CURLOPT_URL, endpoint.get_url().c_str());
 
+  if (endpoint.get_address_policy() ==
+      RGWEndpointAddressPolicy::reject_prohibited) {
+    if (!supports_async_dns()) {
+      return -EOPNOTSUPP;
+    }
+    if (curl_easy_setopt(easy_handle, CURLOPT_NOPROXY, "*") != CURLE_OK ||
+        curl_easy_setopt(easy_handle, CURLOPT_OPENSOCKETFUNCTION,
+                         open_public_socket) != CURLE_OK ||
+        curl_easy_setopt(easy_handle, CURLOPT_OPENSOCKETDATA, nullptr) !=
+          CURLE_OK ||
+        curl_easy_setopt(easy_handle, CURLOPT_FRESH_CONNECT, 1L) != CURLE_OK ||
+        curl_easy_setopt(easy_handle, CURLOPT_FORBID_REUSE, 1L) != CURLE_OK ||
+        curl_easy_setopt(easy_handle, CURLOPT_SSL_VERIFYPEER, 1L) != CURLE_OK ||
+        curl_easy_setopt(easy_handle, CURLOPT_SSL_VERIFYHOST, 2L) != CURLE_OK) {
+      return -EIO;
+    }
+  }
+
   // apply CONNECT_TO mapping if provided for this request
   if (! endpoint.get_connect_to().empty()) {
     if (req_data->connect_to_slist) {
@@ -657,7 +698,8 @@ int RGWHTTPClient::init_request(rgw_http_req_data *_req_data)
   if (h) {
     curl_easy_setopt(easy_handle, CURLOPT_HTTPHEADER, (void *)h);
   }
-  if (!verify_ssl) {
+  if (!verify_ssl && endpoint.get_address_policy() ==
+                       RGWEndpointAddressPolicy::unrestricted) {
     curl_easy_setopt(easy_handle, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(easy_handle, CURLOPT_SSL_VERIFYHOST, 0L);
     dout(20) << "ssl verification is set to off" << dendl;
@@ -1280,4 +1322,3 @@ int RGWHTTP::process(const DoutPrefixProvider* dpp, RGWHTTPClient *req, optional
 
   return req->wait(dpp, y);
 }
-

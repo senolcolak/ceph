@@ -3,6 +3,7 @@
 
 #include "rgw_rest_conn.h"
 #include "rgw_sal.h"
+#include "rgw_secure_endpoint_resolver.h"
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 
@@ -63,11 +64,26 @@ void RGWRESTConn::resolve_endpoints() {
     auto results = resolver.resolve(res_ep.host, "", ec);
     if (!ec && !results.empty()) {
       std::string port_str = std::to_string(res_ep.port);
-      std::string host_port_prefix = res_ep.host + ":" + port_str + ":";
+      const auto connect_host = [](const std::string& host) {
+        // CURLOPT_CONNECT_TO uses colon-separated fields; IPv6 literals must
+        // be bracketed so their colons are not parsed as field separators.
+        if (host.find(':') != std::string::npos &&
+            !(host.size() >= 2 && host.front() == '[' && host.back() == ']')) {
+          return std::string{"["} + host + "]";
+        }
+        return host;
+      };
+      std::string host_port_prefix = connect_host(res_ep.host) + ":" +
+                                     port_str + ":";
 
       res_ep.resolved_ips.reserve(results.size());
       for (const auto& entry : results) {
-        auto ip_str = entry.endpoint().address().to_string();
+        if ((endpoint_selection_policy == RGWEndpointSelectionPolicy::require_pinned ||
+             endpoint_address_policy == RGWEndpointAddressPolicy::reject_prohibited) &&
+            rgw::secure_endpoint::is_prohibited_address(entry.endpoint().address())) {
+          continue;
+        }
+        auto ip_str = connect_host(entry.endpoint().address().to_string());
         res_ep.resolved_ips.emplace_back(host_port_prefix + ip_str + ":" + port_str);
         ldout(cct, 2) << "endpoint_url=" << ep_url << " resolved to ip=" << ip_str << dendl;
       }
@@ -84,11 +100,15 @@ RGWRESTConn::RGWRESTConn(CephContext *_cct, rgw::sal::Driver* driver,
                          const string& _remote_id,
                          const list<string>& remote_endpoints,
                          std::optional<string> _api_name,
-                         HostStyle _host_style)
+                         HostStyle _host_style,
+                         RGWEndpointSelectionPolicy _endpoint_policy,
+                         RGWEndpointAddressPolicy _address_policy)
   : cct(_cct),
     remote_id(_remote_id),
     api_name(_api_name),
-    host_style(_host_style)
+    host_style(_host_style),
+    endpoint_selection_policy(_endpoint_policy),
+    endpoint_address_policy(_address_policy)
 {
   resolved_endpoints.reserve(remote_endpoints.size());
   for (const auto& ep_url : remote_endpoints) {
@@ -100,6 +120,7 @@ RGWRESTConn::RGWRESTConn(CephContext *_cct, rgw::sal::Driver* driver,
 
   if (driver) {
     key = driver->get_zone()->get_system_key();
+    credentials = RGWOutboundCredentials(key);
     self_zone_group = driver->get_zone()->get_zonegroup().get_id();
   }
 }
@@ -110,13 +131,46 @@ RGWRESTConn::RGWRESTConn(CephContext *_cct,
                          RGWAccessKey _cred,
                          std::string _zone_group,
                          std::optional<string> _api_name,
-                         HostStyle _host_style)
+                         HostStyle _host_style,
+                         RGWEndpointSelectionPolicy _endpoint_policy,
+                         RGWEndpointAddressPolicy _address_policy)
   : cct(_cct),
     key(_cred),
+    credentials(_cred),
     self_zone_group(_zone_group),
     remote_id(_remote_id),
     api_name(_api_name),
-    host_style(_host_style)
+    host_style(_host_style),
+    endpoint_selection_policy(_endpoint_policy),
+    endpoint_address_policy(_address_policy)
+{
+  resolved_endpoints.reserve(remote_endpoints.size());
+  for (const auto& ep_url : remote_endpoints) {
+    ResolvedEndpoint res_ep;
+    res_ep.url = ep_url;
+    resolved_endpoints.push_back(std::move(res_ep));
+  }
+  resolve_endpoints();
+}
+
+RGWRESTConn::RGWRESTConn(CephContext *_cct,
+                         const string& _remote_id,
+                         const list<string>& remote_endpoints,
+                         RGWOutboundCredentials _cred,
+                         std::string _zone_group,
+                         std::optional<string> _api_name,
+                         HostStyle _host_style,
+                         RGWEndpointSelectionPolicy _endpoint_policy,
+                         RGWEndpointAddressPolicy _address_policy)
+  : cct(_cct),
+    key(_cred.access_key_id, _cred.secret_key),
+    credentials(std::move(_cred)),
+    self_zone_group(std::move(_zone_group)),
+    remote_id(_remote_id),
+    api_name(_api_name),
+    host_style(_host_style),
+    endpoint_selection_policy(_endpoint_policy),
+    endpoint_address_policy(_address_policy)
 {
   resolved_endpoints.reserve(remote_endpoints.size());
   for (const auto& ep_url : remote_endpoints) {
@@ -133,10 +187,13 @@ RGWRESTConn::RGWRESTConn(RGWRESTConn&& other)
     in_endpoint_fallback(other.in_endpoint_fallback.load()),
     resolved_endpoints(std::move(other.resolved_endpoints)),
     key(std::move(other.key)),
+    credentials(std::move(other.credentials)),
     self_zone_group(std::move(other.self_zone_group)),
     remote_id(std::move(other.remote_id)),
     api_name(std::move(other.api_name)),
-    host_style(other.host_style)
+    host_style(other.host_style),
+    endpoint_selection_policy(other.endpoint_selection_policy),
+    endpoint_address_policy(other.endpoint_address_policy)
 {
 }
 
@@ -147,6 +204,9 @@ RGWRESTConn& RGWRESTConn::operator=(RGWRESTConn&& other)
   in_endpoint_fallback = other.in_endpoint_fallback.load();
   resolved_endpoints = std::move(other.resolved_endpoints);
   key = std::move(other.key);
+  credentials = std::move(other.credentials);
+  endpoint_selection_policy = other.endpoint_selection_policy;
+  endpoint_address_policy = other.endpoint_address_policy;
   self_zone_group = std::move(other.self_zone_group);
   remote_id = std::move(other.remote_id);
   api_name = std::move(other.api_name);
@@ -166,7 +226,8 @@ ResolvedEndpoint* RGWRESTConn::find_resolved_endpoint(const std::string& url)
 
 void RGWRESTConn::populate_connect_to(RGWEndpoint& endpoint, ResolvedEndpoint& resolved_endpoint)
 {
-  if (!cct->_conf->rgw_rest_conn_connect_to_resolved_ips) {
+  if (!cct->_conf->rgw_rest_conn_connect_to_resolved_ips &&
+      endpoint_selection_policy == RGWEndpointSelectionPolicy::allow_fallback) {
     return;
   }
 
@@ -207,6 +268,12 @@ void RGWRESTConn::populate_connect_to(RGWEndpoint& endpoint, ResolvedEndpoint& r
 
 int RGWRESTConn::get_endpoint(RGWEndpoint& endpoint)
 {
+  endpoint.set_address_policy(endpoint_address_policy);
+  const bool allow_fallback =
+    endpoint_selection_policy == RGWEndpointSelectionPolicy::allow_fallback;
+  // A reused endpoint may carry a pin from a previous selection. Clear it
+  // before selecting a new URL so fallback cannot retain a stale mapping.
+  endpoint.set_connect_to("");
   if (resolved_endpoints.empty()) {
     ldout(cct, 0) << "ERROR: endpoints not configured for upstream zone" << dendl;
     return -EINVAL;
@@ -217,9 +284,8 @@ int RGWRESTConn::get_endpoint(RGWEndpoint& endpoint)
 
   // Helper to check if an endpoint has at least one available IP
   auto endpoint_has_available_ip = [&](ResolvedEndpoint& res_ep) -> bool {
-    // If no IP resolution, endpoint is available (will use DNS directly)
     if (res_ep.resolved_ips.empty()) {
-      return true;
+      return allow_fallback;
     }
 
     // Fast path: if no recent failures at endpoint level, all IPs are available
@@ -261,6 +327,9 @@ int RGWRESTConn::get_endpoint(RGWEndpoint& endpoint)
   }
 
   if (num == resolved_endpoints.size()) {
+    if (!allow_fallback) {
+      return -EHOSTUNREACH;
+    }
     // Every tracked IP is down. Return an endpoint without a connect_to hint rather than failing
     ResolvedEndpoint& res_ep = resolved_endpoints[selected_idx];
     endpoint.set_url(res_ep.url);
@@ -279,6 +348,9 @@ int RGWRESTConn::get_endpoint(RGWEndpoint& endpoint)
   }
 
   populate_connect_to(endpoint, resolved_endpoints[selected_idx]);
+  if (!allow_fallback && endpoint.get_connect_to().empty()) {
+    return -EHOSTUNREACH;
+  }
   ldout(cct, 20) << "get_endpoint picked " << endpoint << dendl;
 
   return 0;
@@ -332,7 +404,8 @@ void RGWRESTConn::populate_params(param_vec_t& params, const rgw_owner* uid, con
 
 auto RGWRESTConn::forward(const DoutPrefixProvider *dpp, const rgw_owner& uid,
                           const req_info& info, size_t max_response,
-                          bufferlist *inbl, bufferlist *outbl, optional_yield y)
+                          bufferlist *inbl, bufferlist *outbl, optional_yield y,
+                          std::map<std::string, std::string>* response_headers)
   -> tl::expected<int, int>
 {
   static constexpr int NUM_ENPOINT_IOERROR_RETRIES = 20;
@@ -348,6 +421,9 @@ auto RGWRESTConn::forward(const DoutPrefixProvider *dpp, const rgw_owner& uid,
     RGWRESTSimpleRequest req(cct, info.method, endpoint, NULL, &params, api_name);
     auto result = req.forward_request(dpp, key, info, max_response, inbl, outbl, y);
     if (result) {
+      if (response_headers) {
+        req.get_out_headers(response_headers);
+      }
       return result;
     } else if (result.error() != -ERR_SERVICE_UNAVAILABLE) {
       return result;
@@ -425,7 +501,7 @@ int RGWRESTConn::put_obj_async_init(const DoutPrefixProvider *dpp, const rgw_own
   populate_params(params, &uid, self_zone_group);
   RGWRESTStreamS3PutObj *wr = new RGWRESTStreamS3PutObj(cct, "PUT", endpoint, NULL, &params, api_name, host_style);
   // coverity[uninit_use_in_call:SUPPRESS]
-  wr->put_obj_init(dpp, key, obj, attrs);
+  wr->put_obj_init(dpp, credentials, obj, attrs);
   *req = wr;
   return 0;
 }
@@ -568,7 +644,7 @@ int RGWRESTConn::get_obj(const DoutPrefixProvider *dpp, const rgw_obj& obj, cons
   }
 
   // coverity[uninit_use_in_call:SUPPRESS]
-  int r = (*req)->send_prepare(dpp, key, extra_headers, obj);
+  int r = (*req)->send_prepare(dpp, credentials, extra_headers, obj);
   if (r < 0) {
     goto done_err;
   }
@@ -642,7 +718,7 @@ int RGWRESTConn::get_resource(const DoutPrefixProvider *dpp,
       headers.insert(extra_headers->begin(), extra_headers->end());
     }
 
-    ret = req.send_request(dpp, &key, headers, resource, mgr, send_data);
+    ret = req.send_request(dpp, credentials, headers, resource, mgr, send_data);
     if (ret < 0) {
       ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << ret << dendl;
       return ret;
@@ -696,7 +772,7 @@ int RGWRESTConn::send_resource(const DoutPrefixProvider *dpp, const std::string&
       headers.insert(extra_headers->begin(), extra_headers->end());
     }
 
-    ret = req.send_request(dpp, &key, headers, resource, mgr, send_data);
+    ret = req.send_request(dpp, credentials, headers, resource, mgr, send_data);
     if (ret < 0) {
       ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << ret << dendl;
       return ret;
@@ -755,7 +831,7 @@ void RGWRESTReadResource::init_common(param_vec_t *extra_headers)
 
 int RGWRESTReadResource::read(const DoutPrefixProvider *dpp, optional_yield y)
 {
-  int ret = req.send_request(dpp, &conn->get_key(), headers, resource, mgr);
+  int ret = req.send_request(dpp, conn->get_credentials(), headers, resource, mgr);
   if (ret < 0) {
     ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << ret << dendl;
     return ret;
@@ -772,7 +848,7 @@ int RGWRESTReadResource::read(const DoutPrefixProvider *dpp, optional_yield y)
 
 int RGWRESTReadResource::aio_read(const DoutPrefixProvider *dpp)
 {
-  int ret = req.send_request(dpp, &conn->get_key(), headers, resource, mgr);
+  int ret = req.send_request(dpp, conn->get_credentials(), headers, resource, mgr);
   if (ret < 0) {
     ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << ret << dendl;
     return ret;
@@ -822,7 +898,7 @@ int RGWRESTSendResource::send(const DoutPrefixProvider *dpp, bufferlist& outbl, 
   req.set_send_length(outbl.length());
   req.set_outbl(outbl);
 
-  int ret = req.send_request(dpp, &conn->get_key(), headers, resource, mgr);
+  int ret = req.send_request(dpp, conn->get_credentials(), headers, resource, mgr);
   if (ret < 0) {
     ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << ret << dendl;
     return ret;
@@ -842,7 +918,7 @@ int RGWRESTSendResource::aio_send(const DoutPrefixProvider *dpp, bufferlist& out
   req.set_send_length(outbl.length());
   req.set_outbl(outbl);
 
-  int ret = req.send_request(dpp, &conn->get_key(), headers, resource, mgr);
+  int ret = req.send_request(dpp, conn->get_credentials(), headers, resource, mgr);
   if (ret < 0) {
     ldpp_dout(dpp, 5) << __func__ << ": send_request() resource=" << resource << " returned ret=" << ret << dendl;
     return ret;

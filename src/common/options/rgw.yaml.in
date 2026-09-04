@@ -3372,6 +3372,87 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_tenant_cloud_vault_auth
+  type: str
+  level: advanced
+  desc: Authentication method for the tenant-cloud Vault credential provider.
+  default: token
+  enum_values:
+  - token
+  - agent
+  services:
+  - rgw
+- name: rgw_tenant_cloud_vault_token_file
+  type: str
+  level: advanced
+  desc: Restricted Vault token file for tenant-cloud credential resolution.
+  services:
+  - rgw
+- name: rgw_tenant_cloud_vault_addr
+  type: str
+  level: advanced
+  desc: Vault server address for tenant-cloud credential resolution.
+  services:
+  - rgw
+- name: rgw_tenant_cloud_vault_prefix
+  type: str
+  level: advanced
+  desc: Operator-controlled Vault path prefix for tenant-cloud credentials.
+  services:
+  - rgw
+- name: rgw_tenant_cloud_vault_namespace
+  type: str
+  level: advanced
+  desc: Vault namespace for tenant-cloud credential resolution.
+  services:
+  - rgw
+- name: rgw_tenant_cloud_vault_verify_ssl
+  type: bool
+  level: advanced
+  desc: Verify the Vault server certificate for tenant-cloud resolution.
+  default: true
+  services:
+  - rgw
+- name: rgw_tenant_cloud_vault_ssl_cacert
+  type: str
+  level: advanced
+  desc: CA certificate path for tenant-cloud Vault access.
+  services:
+  - rgw
+- name: rgw_tenant_cloud_vault_ssl_clientcert
+  type: str
+  level: advanced
+  desc: Client certificate path for tenant-cloud Vault access.
+  services:
+  - rgw
+- name: rgw_tenant_cloud_vault_ssl_clientkey
+  type: str
+  level: advanced
+  desc: Client private key path for tenant-cloud Vault access.
+  services:
+  - rgw
+- name: rgw_tenant_cloud_credential_cache_size
+  type: uint
+  level: advanced
+  desc: Maximum number of tenant-cloud credential entries cached by RGW.
+  default: 1024
+  services:
+  - rgw
+- name: rgw_tenant_cloud_credential_cache_ttl_secs
+  type: uint
+  level: advanced
+  desc: Maximum lifetime in seconds of a tenant-cloud credential cache entry.
+  default: 300
+  services:
+  - rgw
+- name: rgw_tenant_cloud_endpoint_allowlist
+  type: str
+  level: advanced
+  desc: Comma-separated exact hostnames permitted as tenant-cloud replication destinations. An empty value denies all destinations.
+  services:
+  - rgw
+  flags:
+  - runtime
 - name: rgw_crypt_kmip_addr
   type: str
   level: advanced

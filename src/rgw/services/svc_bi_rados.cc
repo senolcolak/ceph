@@ -1046,3 +1046,51 @@ int RGWSI_BucketIndex_RADOS::handle_overwrite(const DoutPrefixProvider *dpp,
 
   return ret;
 }
+
+int RGWSI_BucketIndex_RADOS::handle_sync_policy_update(
+    const DoutPrefixProvider* dpp, const RGWBucketInfo& info,
+    const RGWBucketInfo& /*orig_info*/, bool tenant_cloud_activation,
+    optional_yield y)
+{
+  const bool new_policy = info.sync_policy && !info.sync_policy->empty();
+  if (!tenant_cloud_activation) {
+    return 0;
+  }
+  if (!new_policy || info.layout.logs.empty()) {
+    ldpp_dout(dpp, -1) << "ERROR: tenant-cloud activation requires an"
+                        << " in-index bucket data log" << dendl;
+    return -EOPNOTSUPP;
+  }
+  if (!svc.datalog_rados) {
+    ldpp_dout(dpp, -1) << "ERROR: tenant-cloud activation has no data-log service"
+                        << dendl;
+    return -EIO;
+  }
+  // Data-log activation records are idempotent notifications. Repeat the
+  // notification for an already-enabled tenant-cloud policy so a metadata
+  // retry after a partial activation can recover shards whose records were
+  // not written before the original attempt failed.
+  const auto& bilog = info.layout.logs.back();
+  if (bilog.layout.type != rgw::BucketLogType::InIndex) {
+    // Tenant-cloud v1 has no activation marker for other layouts. Failing the
+    // metadata operation keeps the metadata-log entry retryable instead of
+    // reporting success without scheduling historical objects.
+    return -EOPNOTSUPP;
+  }
+  const int shards_num = rgw::num_shards(bilog.layout.in_index);
+  if (shards_num <= 0) {
+    return -EOPNOTSUPP;
+  }
+  for (int shard = 0; shard < shards_num; ++shard) {
+    const int ret = svc.datalog_rados->add_entry(
+      dpp, info, bilog, shard, y);
+    if (ret < 0) {
+      ldpp_dout(dpp, -1) << "ERROR: failed scheduling initial bucket sync"
+                          << " (bucket=" << info.bucket
+                          << ", shard=" << shard << ") ret="
+                          << ret << dendl;
+      return ret;
+    }
+  }
+  return 0;
+}

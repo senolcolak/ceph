@@ -15,6 +15,15 @@ TEST(RGWEndpointTest, default_constructor) {
   EXPECT_TRUE(ep.get_url().empty());
   EXPECT_TRUE(ep.get_endpoint_url_lookup_id().empty());
   EXPECT_TRUE(ep.get_connect_to().empty());
+  EXPECT_EQ(RGWEndpointAddressPolicy::unrestricted, ep.get_address_policy());
+}
+
+TEST(RGWEndpointTest, address_policy_is_preserved) {
+  RGWEndpoint ep("https://example.com");
+  ep.set_address_policy(RGWEndpointAddressPolicy::reject_prohibited);
+  RGWEndpoint copy = ep;
+  EXPECT_EQ(RGWEndpointAddressPolicy::reject_prohibited,
+            copy.get_address_policy());
 }
 
 TEST(RGWEndpointTest, constructor_sets_url_and_lookup_id) {

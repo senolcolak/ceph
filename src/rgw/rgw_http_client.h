@@ -36,11 +36,18 @@ class RGWHTTPManager;
  *  - url:         boost::urls::url for the request URL (mutable via set_path, etc.).
  *  - connect_to:  libcurl CONNECT_TO string (format: "host:port:addr:port").
  */
+enum class RGWEndpointAddressPolicy {
+  unrestricted,
+  reject_prohibited,
+};
+
 struct RGWEndpoint {
 private:
   std::string endpoint_url_lookup_id;
   boost::urls::url url;
   std::string connect_to;
+  RGWEndpointAddressPolicy address_policy{
+    RGWEndpointAddressPolicy::unrestricted};
 
 public:
   RGWEndpoint() = default;
@@ -93,6 +100,12 @@ public:
 
   void set_connect_to(const std::string& c) { connect_to = c; }
   const std::string& get_connect_to() const { return connect_to; }
+  void set_address_policy(RGWEndpointAddressPolicy policy) {
+    address_policy = policy;
+  }
+  RGWEndpointAddressPolicy get_address_policy() const {
+    return address_policy;
+  }
 
   friend std::ostream& operator<<(std::ostream& os, const RGWEndpoint& ep) {
     os << "RGWEndpoint: url=" << ep.url.buffer()

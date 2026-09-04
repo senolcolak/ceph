@@ -1100,6 +1100,10 @@ struct ReplicationConfiguration {
       std::optional<AccessControlTranslation> acl_translation;
       std::optional<string> account;
       string bucket;
+      std::optional<string> credential_ref; /* rgw extension */
+      std::optional<string> endpoint; /* rgw extension */
+      std::optional<string> host_style; /* rgw extension */
+      std::optional<string> region; /* rgw extension */
       std::optional<string> storage_class;
       std::vector<string> zone_names;
 
@@ -1110,6 +1114,22 @@ struct ReplicationConfiguration {
           account.reset();
         }
         RGWXMLDecoder::decode_xml("Bucket", bucket, obj);
+        RGWXMLDecoder::decode_xml("CredentialRef", credential_ref, obj);
+        if (credential_ref && credential_ref->empty()) {
+          credential_ref.reset();
+        }
+        RGWXMLDecoder::decode_xml("Endpoint", endpoint, obj);
+        if (endpoint && endpoint->empty()) {
+          endpoint.reset();
+        }
+        RGWXMLDecoder::decode_xml("HostStyle", host_style, obj);
+        if (host_style && host_style->empty()) {
+          host_style.reset();
+        }
+        RGWXMLDecoder::decode_xml("Region", region, obj);
+        if (region && region->empty()) {
+          region.reset();
+        }
         RGWXMLDecoder::decode_xml("StorageClass", storage_class, obj);
         if (storage_class && storage_class->empty()) {
           storage_class.reset();
@@ -1121,6 +1141,10 @@ struct ReplicationConfiguration {
         encode_xml("AccessControlTranslation", acl_translation, f);
         encode_xml("Account", account, f);
         encode_xml("Bucket", bucket, f);
+        encode_xml("CredentialRef", credential_ref, f);
+        encode_xml("Endpoint", endpoint, f);
+        encode_xml("HostStyle", host_style, f);
+        encode_xml("Region", region, f);
         encode_xml("StorageClass", storage_class, f);
         encode_xml("Zone", zone_names, f);
       }
@@ -1368,7 +1392,9 @@ struct ReplicationConfiguration {
 
     int to_sync_policy_pipe(req_state *s, rgw::sal::Driver* driver,
                             rgw_sync_bucket_pipes *pipe,
-                            bool *enabled) const {
+                            bool *enabled,
+                            std::optional<rgw::tenant_cloud::Config>
+                              *tenant_cloud_config) const {
       if (!is_valid(s->cct)) {
         return -EINVAL;
       }
@@ -1386,25 +1412,128 @@ struct ReplicationConfiguration {
       const auto& tenant_owner = std::get_if<rgw_user>(&s->owner.id)->tenant;
 
       auto dest_bk_arn = ARN::parse(destination.bucket);
-      if (!dest_bk_arn || dest_bk_arn->service != rgw::Service::s3 || dest_bk_arn->resource.empty()) {
+      if (!dest_bk_arn || dest_bk_arn->service != rgw::Service::s3 ||
+          dest_bk_arn->resource.empty()) {
         s->err.message = "Invalid bucket ARN";
         return -EINVAL;
       }
 
       rgw_bucket_key dest_bk(tenant_owner,
                              dest_bk_arn->resource);
+      const bool has_endpoint = destination.endpoint.has_value();
+      const bool has_credential = destination.credential_ref.has_value();
+      if (has_endpoint != has_credential) {
+        s->err.message = "Endpoint and CredentialRef must be specified together";
+        return -EINVAL;
+      }
+      if (!has_endpoint &&
+          (destination.region || destination.host_style)) {
+        s->err.message =
+          "Region and HostStyle require Endpoint and CredentialRef";
+        return -EINVAL;
+      }
 
       if (source && !source->zone_names.empty()) {
         pipe->source.zones = get_zone_ids_from_names(driver, source->zone_names);
       } else {
         pipe->source.set_all_zones(true);
       }
+      if (has_endpoint) {
+        if (!dest_bk_arn->region.empty() || !dest_bk_arn->account.empty() ||
+            dest_bk_arn->resource.find_first_of("/:") != string::npos) {
+          s->err.message = "External destination must be an S3 bucket ARN";
+          return -EINVAL;
+        }
+        if (*tenant_cloud_config) {
+          s->err.message = "Only one external replication rule is supported";
+          return -EINVAL;
+        }
+        if (destination.zone_names.size() != 1) {
+          s->err.message = "External replication requires exactly one destination Zone";
+          return -EINVAL;
+        }
+        if (!source || source->zone_names.size() != 1) {
+          s->err.message =
+            "The tenant-cloud PoC requires exactly one source Zone";
+          return -ERR_NOT_IMPLEMENTED;
+        }
+        std::unique_ptr<rgw::sal::Zone> source_zone;
+        int ret = driver->get_zone()->get_zonegroup().get_zone_by_name(
+          source->zone_names.front(), &source_zone);
+        const auto source_tier = ret < 0 ? std::string_view{} :
+          source_zone->get_tier_type();
+        if (ret < 0 || !source_zone ||
+            (!source_tier.empty() && source_tier != "rgw")) {
+          s->err.message =
+            "External replication source Zone must use tier_type rgw";
+          return -EINVAL;
+        }
+        if (s->bucket->get_info().versioned()) {
+          s->err.message =
+            "The tenant-cloud PoC does not safely replicate versioned buckets";
+          return -ERR_NOT_IMPLEMENTED;
+        }
+        if (filter && (filter->tag ||
+                       (filter->and_elements &&
+                        !filter->and_elements->tags.empty()))) {
+          s->err.message =
+            "The tenant-cloud PoC supports prefix filters only";
+          return -ERR_NOT_IMPLEMENTED;
+        }
+        if (delete_marker_replication &&
+            delete_marker_replication->status == "Enabled") {
+          s->err.message =
+            "The tenant-cloud PoC does not support delete-marker replication";
+          return -ERR_NOT_IMPLEMENTED;
+        }
+        if (destination.account || destination.acl_translation) {
+          s->err.message =
+            "Account and AccessControlTranslation are not supported for external replication";
+          return -EINVAL;
+        }
+
+        std::unique_ptr<rgw::sal::Zone> zone;
+        ret = driver->get_zone()->get_zonegroup().get_zone_by_name(
+          destination.zone_names.front(), &zone);
+        if (ret < 0 || !zone ||
+            zone->get_tier_type() != "tenant-cloud") {
+          s->err.message = "External replication Zone must use tier_type tenant-cloud";
+          return -EINVAL;
+        }
+
+        rgw::tenant_cloud::Config config;
+        config.rule_id = id;
+        config.endpoint = *destination.endpoint;
+        config.credential_ref = *destination.credential_ref;
+        config.target_bucket_arn = destination.bucket;
+        config.source_zone_id = source_zone->get_id();
+        config.target_zone_id = zone->get_id();
+        config.region = destination.region.value_or(string());
+        config.host_style = destination.host_style.value_or("path");
+        config.enabled = (status == "Enabled");
+        ret = rgw::tenant_cloud::validate(config, &s->err.message);
+        if (ret < 0) {
+          return ret;
+        }
+        ret = rgw::tenant_cloud::validate_endpoint_policy(
+          s->cct, config, &s->err.message);
+        if (ret < 0) {
+          return ret;
+        }
+        *tenant_cloud_config = std::move(config);
+
+        // RGWSyncBucketCR requires a real Ceph bucket on both sides. The
+        // external ARN is retained only in the versioned bucket attribute.
+        pipe->dest.bucket = s->bucket->get_info().bucket;
+      } else {
+        pipe->dest.bucket.emplace(dest_bk);
+      }
+
       if (!destination.zone_names.empty()) {
         pipe->dest.zones = get_zone_ids_from_names(driver, destination.zone_names);
       } else {
         pipe->dest.set_all_zones(true);
       }
-      pipe->dest.bucket.emplace(dest_bk);
 
       if (filter) {
         int r = filter->to_sync_pipe_filter(s->cct, &pipe->params.source.filter);
@@ -1494,7 +1623,10 @@ struct ReplicationConfiguration {
   }
 
   int to_sync_policy_groups(req_state *s, rgw::sal::Driver* driver,
-                            vector<rgw_sync_policy_group> *result) const {
+                            vector<rgw_sync_policy_group> *result,
+                            std::optional<rgw::tenant_cloud::Config>
+                              *tenant_cloud_config) const {
+    tenant_cloud_config->reset();
     result->resize(2);
 
     rgw_sync_policy_group& enabled_group = (*result)[0];
@@ -1514,7 +1646,8 @@ struct ReplicationConfiguration {
 
       rgw_sync_bucket_pipes pipe;
       bool enabled;
-      int r = rule.to_sync_policy_pipe(s, driver, &pipe, &enabled);
+      int r = rule.to_sync_policy_pipe(s, driver, &pipe, &enabled,
+                                       tenant_cloud_config);
       if (r < 0) {
         ldpp_dout(s, 5) << "NOTICE: failed to convert replication configuration into sync policy pipe (rule.id=" << rule.id << "): " << cpp_strerror(-r) << dendl;
         return r;
@@ -1525,6 +1658,10 @@ struct ReplicationConfiguration {
       } else {
         disabled_group.pipes.emplace_back(std::move(pipe));
       }
+    }
+    if (*tenant_cloud_config && rules.size() != 1) {
+      s->err.message = "External replication cannot be mixed with other rules";
+      return -EINVAL;
     }
     return 0;
   }
@@ -1545,12 +1682,6 @@ struct ReplicationConfiguration {
 
 void RGWGetBucketReplication_ObjStore_S3::send_response_data()
 {
-  if (op_ret)
-    set_req_state_err(s, op_ret);
-  dump_errno(s);
-  end_header(s, this, to_mime_type(s->format));
-  dump_start(s);
-
   ReplicationConfiguration conf;
 
   if (s->bucket->get_info().sync_policy) {
@@ -1565,6 +1696,90 @@ void RGWGetBucketReplication_ObjStore_S3::send_response_data()
       conf.from_sync_policy_group(driver, iter->second);
     }
   }
+
+  std::optional<rgw::tenant_cloud::Config> tenant_cloud_config;
+  if (!op_ret) {
+    op_ret = rgw::tenant_cloud::decode_config(s->bucket->get_attrs(),
+                                               &tenant_cloud_config);
+  }
+  if (!op_ret && tenant_cloud_config) {
+    std::string validation_error;
+    op_ret = rgw::tenant_cloud::validate(*tenant_cloud_config,
+                                          &validation_error);
+    if (op_ret < 0) {
+      s->err.message = "invalid tenant-cloud bucket configuration";
+    }
+  }
+  if (!op_ret && tenant_cloud_config) {
+    if (!s->bucket->get_info().sync_policy) {
+      op_ret = -EIO;
+      s->err.message =
+        "tenant-cloud configuration has no matching sync policy";
+    }
+  }
+  if (!op_ret && tenant_cloud_config) {
+    const auto& policy = *s->bucket->get_info().sync_policy;
+    const auto expected_group_id = tenant_cloud_config->enabled ?
+      enabled_group_id : disabled_group_id;
+    const rgw_sync_bucket_pipes* external_pipe = nullptr;
+    bool wrong_group = false;
+    for (const auto& [group_id, group] : policy.groups) {
+      for (const auto& pipe : group.pipes) {
+        if (pipe.id == tenant_cloud_config->rule_id) {
+          if (external_pipe || group_id != expected_group_id) {
+            op_ret = -EIO;
+            wrong_group = true;
+            break;
+          }
+          external_pipe = &pipe;
+        }
+      }
+      if (wrong_group) {
+        break;
+      }
+    }
+
+    if (!op_ret &&
+        (!external_pipe || !external_pipe->dest.bucket ||
+         *external_pipe->dest.bucket != s->bucket->get_info().bucket ||
+         !external_pipe->dest.zones ||
+         external_pipe->dest.zones->size() != 1 ||
+         external_pipe->dest.zones->begin()->id !=
+           tenant_cloud_config->target_zone_id)) {
+      op_ret = -EIO;
+    }
+    if (op_ret < 0) {
+      s->err.message =
+        "tenant-cloud configuration does not match its sync policy";
+    }
+  }
+  if (!op_ret && tenant_cloud_config) {
+    auto rule = std::find_if(conf.rules.begin(), conf.rules.end(),
+      [&tenant_cloud_config](const auto& candidate) {
+        return candidate.id == tenant_cloud_config->rule_id;
+      });
+    if (rule == conf.rules.end()) {
+      op_ret = -EIO;
+      s->err.message = "tenant-cloud configuration does not match its sync policy";
+    } else {
+      rule->destination.bucket = tenant_cloud_config->target_bucket_arn;
+      rule->destination.endpoint = tenant_cloud_config->endpoint;
+      rule->destination.credential_ref =
+        tenant_cloud_config->credential_ref;
+      if (!tenant_cloud_config->region.empty()) {
+        rule->destination.region = tenant_cloud_config->region;
+      }
+      rule->destination.host_style = tenant_cloud_config->host_style;
+      rule->delete_marker_replication.emplace();
+      rule->delete_marker_replication->status = "Disabled";
+    }
+  }
+
+  if (op_ret)
+    set_req_state_err(s, op_ret);
+  dump_errno(s);
+  end_header(s, this, to_mime_type(s->format));
+  dump_start(s);
 
   if (!op_ret) {
   s->formatter->open_object_section_in_ns("ReplicationConfiguration", XMLNS_AWS_S3);
@@ -1604,7 +1819,8 @@ int RGWPutBucketReplication_ObjStore_S3::get_params(optional_yield y)
     return -ERR_MALFORMED_XML;
   }
 
-  r = conf.to_sync_policy_groups(s, driver, &sync_policy_groups);
+  r = conf.to_sync_policy_groups(s, driver, &sync_policy_groups,
+                                 &tenant_cloud_config);
   if (r < 0) {
     return r;
   }
@@ -1622,6 +1838,10 @@ void RGWPutBucketReplication_ObjStore_S3::send_response()
 {
   if (op_ret)
     set_req_state_err(s, op_ret);
+  if (tenant_cloud_master_result) {
+    dump_header(s, "x-rgw-tenant-cloud-state",
+                *tenant_cloud_master_result ? "1" : "0");
+  }
   dump_errno(s);
   end_header(s, this, to_mime_type(s->format));
   dump_start(s);
@@ -1637,6 +1857,10 @@ void RGWDeleteBucketReplication_ObjStore_S3::send_response()
 {
   if (op_ret)
     set_req_state_err(s, op_ret);
+  if (tenant_cloud_master_result) {
+    dump_header(s, "x-rgw-tenant-cloud-state",
+                *tenant_cloud_master_result ? "1" : "0");
+  }
   dump_errno(s);
   end_header(s, this, to_mime_type(s->format));
   dump_start(s);

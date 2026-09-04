@@ -10500,13 +10500,16 @@ int RGWRados::try_refresh_bucket_info(RGWBucketInfo& info,
 
 int RGWRados::put_bucket_instance_info(RGWBucketInfo& info, bool exclusive,
                               real_time mtime, const map<string, bufferlist> *pattrs,
-                              const DoutPrefixProvider *dpp, optional_yield y)
+                              const DoutPrefixProvider *dpp, optional_yield y,
+                              bool tenant_cloud_activation)
 {
   return ctl.bucket->store_bucket_instance_info(info.bucket, info, y, dpp,
-						RGWBucketCtl::BucketInstance::PutParams()
-						.set_exclusive(exclusive)
-						.set_mtime(mtime)
-						.set_attrs(pattrs));
+                                                RGWBucketCtl::BucketInstance::PutParams()
+                                                .set_exclusive(exclusive)
+                                                .set_mtime(mtime)
+                                                .set_attrs(pattrs)
+                                                .set_tenant_cloud_activation(
+                                                  tenant_cloud_activation));
 }
 
 int RGWRados::put_linked_bucket_info(RGWBucketInfo& info, bool exclusive, real_time mtime, obj_version *pep_objv,
