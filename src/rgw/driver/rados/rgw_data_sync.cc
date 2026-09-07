@@ -1426,6 +1426,59 @@ public:
   int operate(const DoutPrefixProvider *dpp) override;
 };
 
+namespace rgw::data_sync {
+namespace {
+
+class PersistRetryBeforeMarkerCR final : public RGWCoroutine {
+  std::unique_ptr<RGWCoroutine> retry_write;
+  std::unique_ptr<RGWCoroutine> marker_write;
+  MarkerFinishFactory finish_marker;
+
+public:
+  PersistRetryBeforeMarkerCR(CephContext* cct, RGWCoroutine* retry_write,
+                             MarkerFinishFactory finish_marker)
+    : RGWCoroutine(cct), retry_write(retry_write),
+      finish_marker(std::move(finish_marker))
+  {
+  }
+
+  int operate(const DoutPrefixProvider*) override
+  {
+    reenter(this) {
+      if (!retry_write) {
+        return set_cr_error(-EINVAL);
+      }
+      yield call(retry_write.release());
+      if (retcode < 0) {
+        return set_cr_error(retcode);
+      }
+      if (finish_marker) {
+        marker_write.reset(finish_marker());
+        if (marker_write) {
+          yield call(marker_write.release());
+          if (retcode < 0) {
+            return set_cr_error(retcode);
+          }
+        }
+      }
+      return set_cr_done();
+    }
+    return 0;
+  }
+};
+
+} // anonymous namespace
+
+RGWCoroutine* persist_retry_before_marker(
+    CephContext* cct, RGWCoroutine* retry_write,
+    MarkerFinishFactory finish_marker)
+{
+  return new PersistRetryBeforeMarkerCR(
+      cct, retry_write, std::move(finish_marker));
+}
+
+} // namespace rgw::data_sync
+
 class RGWDataSyncSingleEntryCR : public RGWCoroutine {
   RGWDataSyncCtx *sc;
   RGWDataSyncEnv *sync_env;
@@ -1527,16 +1580,25 @@ public:
         }
         if (complete->timestamp != ceph::real_time{}) {
           tn->log(10, SSTR("writing " << *complete << " to error repo for retry"));
-          yield call(rgw::error_repo::write_cr(sync_env->driver->getRados()->get_rados_handle(), error_repo,
-                                              rgw::error_repo::encode_key(complete->bs, complete->gen),
-                                              complete->timestamp));
+          yield call(rgw::data_sync::persist_retry_before_marker(
+            cct,
+            rgw::error_repo::write_cr(
+              sync_env->driver->getRados()->get_rados_handle(), error_repo,
+              rgw::error_repo::encode_key(complete->bs, complete->gen),
+              complete->timestamp),
+            [this] {
+              if (marker_tracker && !complete->marker.empty()) {
+                return marker_tracker->finish(complete->marker);
+              }
+              return static_cast<RGWCoroutine*>(nullptr);
+            }));
           if (retcode < 0) {
-            tn->log(0, SSTR("ERROR: failed to log sync failure in error repo: retcode=" << retcode));
-            // The outer data-log marker must not advance unless this failed
-            // bucket obligation has durable retry ownership. Returning here
-            // leaves the marker unfinished so the data-log entry is replayed.
+            tn->log(0, SSTR("ERROR: failed to persist retry ownership or "
+                            "finish its data-log marker: retcode="
+                            << retcode));
             return set_cr_error(retcode);
           }
+          return set_cr_error(sync_status);
         }
       } else if (complete->retry) {
         yield call(rgw::error_repo::remove_cr(sync_env->driver->getRados()->get_rados_handle(), error_repo,

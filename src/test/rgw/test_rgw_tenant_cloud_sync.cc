@@ -31,6 +31,38 @@ public:
   }
 };
 
+TEST(RGWDataSync, LeavesMarkerUnfinishedWhenErrorRepoWriteFails)
+{
+  bool marker_finished = false;
+  auto finish_marker = [&marker_finished]() -> RGWCoroutine* {
+    marker_finished = true;
+    return new DoneCR(g_ceph_context);
+  };
+  auto* operation = rgw::data_sync::persist_retry_before_marker(
+    g_ceph_context, new DoneCR(g_ceph_context, -EIO), finish_marker);
+
+  RGWCoroutinesManager manager(g_ceph_context, nullptr);
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(-EIO, manager.run(&dpp, operation));
+  EXPECT_FALSE(marker_finished);
+}
+
+TEST(RGWDataSync, FinishesMarkerAfterRetryOwnershipIsDurable)
+{
+  bool marker_finished = false;
+  auto finish_marker = [&marker_finished]() -> RGWCoroutine* {
+    marker_finished = true;
+    return new DoneCR(g_ceph_context);
+  };
+  auto* operation = rgw::data_sync::persist_retry_before_marker(
+    g_ceph_context, new DoneCR(g_ceph_context), finish_marker);
+
+  RGWCoroutinesManager manager(g_ceph_context, nullptr);
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(0, manager.run(&dpp, operation));
+  EXPECT_TRUE(marker_finished);
+}
+
 class DelayedErrorCR final : public RGWCoroutine {
   int result;
 
@@ -484,6 +516,27 @@ TEST(RGWTenantCloudSync, RunsInjectedProviderDeleteCoroutine)
   EXPECT_EQ(0, manager.run(&dpp, operation));
   EXPECT_EQ(1u, provider->resolve_count);
   EXPECT_TRUE(provider->target->delete_called);
+}
+
+TEST(RGWTenantCloudSync, RejectsDeleteWithoutSyncEnvironment)
+{
+  auto provider = std::make_shared<FakeProvider>();
+  auto module = tc::make_data_sync_module(provider);
+  RGWDataSyncCtx sync;
+  sync.cct = g_ceph_context;
+  sync.source_zone = rgw_zone_id{"source-zone"};
+
+  auto pipe = sync_pipe();
+  rgw_obj_key key{"object"};
+  real_time mtime;
+  auto* operation = module->remove_object(nullptr, &sync, pipe, key, mtime,
+                                          false, 0, nullptr);
+  ASSERT_NE(nullptr, operation);
+  RGWCoroutinesManager manager(g_ceph_context, nullptr);
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(-EIO, manager.run(&dpp, operation));
+  EXPECT_EQ(0u, provider->resolve_count);
+  EXPECT_FALSE(provider->target->delete_called);
 }
 
 TEST(RGWTenantCloudSync, RefreshesCredentialsOnceAfterDeleteAuthFailure)

@@ -138,6 +138,10 @@ public:
 
 int load_token(const std::string& path, std::string* token)
 {
+  if (!token) {
+    return -EINVAL;
+  }
+  token->clear();
   struct stat token_st;
   if (path.empty()) {
     return -EINVAL;
@@ -159,12 +163,22 @@ int load_token(const std::string& path, std::string* token)
   while (length && std::isspace(static_cast<unsigned char>(buf[length - 1]))) {
     --length;
   }
+  if (length == 0) {
+    ::ceph::crypto::zeroize_for_security(buf, sizeof(buf));
+    return -EACCES;
+  }
   token->assign(buf, static_cast<size_t>(length));
   ::ceph::crypto::zeroize_for_security(buf, sizeof(buf));
-  return length;
+  return 0;
 }
 
 } // anonymous namespace
+
+int rgw::vault::testing::load_token(const std::string& path,
+                                    std::string* token)
+{
+  return ::load_token(path, token);
+}
 
 int RGWVaultClient::request(const DoutPrefixProvider* dpp, const char* method,
                             std::string_view path,

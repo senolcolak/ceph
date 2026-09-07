@@ -24,6 +24,12 @@ struct RGWVaultConfig {
   bool verify_ssl{true};
 };
 
+namespace rgw::vault::testing {
+
+int load_token(const std::string& path, std::string* token);
+
+} // namespace rgw::vault::testing
+
 class RGWVaultClient {
   CephContext* cct;
   RGWVaultConfig config;

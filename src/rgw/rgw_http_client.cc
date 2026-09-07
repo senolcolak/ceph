@@ -49,6 +49,29 @@ curl_socket_t open_public_socket(void*, curlsocktype purpose,
 
 } // anonymous namespace
 
+int rgw_apply_reject_prohibited_address_policy(
+    CURL* easy_handle, RGWCurlOpenSocketCallback callback)
+{
+  if (!easy_handle) {
+    return -EINVAL;
+  }
+  if (!callback) {
+    callback = open_public_socket;
+  }
+  if (curl_easy_setopt(easy_handle, CURLOPT_NOPROXY, "*") != CURLE_OK ||
+      curl_easy_setopt(easy_handle, CURLOPT_OPENSOCKETFUNCTION, callback) !=
+        CURLE_OK ||
+      curl_easy_setopt(easy_handle, CURLOPT_OPENSOCKETDATA, nullptr) !=
+        CURLE_OK ||
+      curl_easy_setopt(easy_handle, CURLOPT_FRESH_CONNECT, 1L) != CURLE_OK ||
+      curl_easy_setopt(easy_handle, CURLOPT_FORBID_REUSE, 1L) != CURLE_OK ||
+      curl_easy_setopt(easy_handle, CURLOPT_SSL_VERIFYPEER, 1L) != CURLE_OK ||
+      curl_easy_setopt(easy_handle, CURLOPT_SSL_VERIFYHOST, 2L) != CURLE_OK) {
+    return -EIO;
+  }
+  return 0;
+}
+
 RGWHTTPManager *rgw_http_manager;
 
 struct RGWCurlHandle;
@@ -631,16 +654,10 @@ int RGWHTTPClient::init_request(rgw_http_req_data *_req_data)
     if (!supports_async_dns()) {
       return -EOPNOTSUPP;
     }
-    if (curl_easy_setopt(easy_handle, CURLOPT_NOPROXY, "*") != CURLE_OK ||
-        curl_easy_setopt(easy_handle, CURLOPT_OPENSOCKETFUNCTION,
-                         open_public_socket) != CURLE_OK ||
-        curl_easy_setopt(easy_handle, CURLOPT_OPENSOCKETDATA, nullptr) !=
-          CURLE_OK ||
-        curl_easy_setopt(easy_handle, CURLOPT_FRESH_CONNECT, 1L) != CURLE_OK ||
-        curl_easy_setopt(easy_handle, CURLOPT_FORBID_REUSE, 1L) != CURLE_OK ||
-        curl_easy_setopt(easy_handle, CURLOPT_SSL_VERIFYPEER, 1L) != CURLE_OK ||
-        curl_easy_setopt(easy_handle, CURLOPT_SSL_VERIFYHOST, 2L) != CURLE_OK) {
-      return -EIO;
+    const int result =
+      rgw_apply_reject_prohibited_address_policy(easy_handle);
+    if (result < 0) {
+      return result;
     }
   }
 

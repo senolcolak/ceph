@@ -4,12 +4,12 @@
 #include "rgw_sync_s3_transfer.h"
 
 #include <cerrno>
-#include <cstdlib>
 #include <memory>
 #include <utility>
 
 #include <boost/asio/yield.hpp>
 
+#include "common/strtol.h"
 #include "rgw_acl.h"
 #include "rgw_rest_conn.h"
 
@@ -60,10 +60,22 @@ int decode_rest_obj(const DoutPrefixProvider* dpp,
   if (!info) {
     return -EINVAL;
   }
+  const auto size = headers.find("RGWX_OBJECT_SIZE");
+  if (size == headers.end()) {
+    ldpp_dout(dpp, 0) << "ERROR: source object size header is missing"
+                      << dendl;
+    return -EIO;
+  }
+  std::string error;
+  const auto content_len = strict_strtoll(size->second, 10, &error);
+  if (!error.empty() || content_len < 0) {
+    ldpp_dout(dpp, 0) << "ERROR: failed to decode source object size"
+                      << (error.empty() ? "" : ": ") << error << dendl;
+    return -EIO;
+  }
+  info->content_len = content_len;
   for (const auto& [name, value] : headers) {
-    if (name == "RGWX_OBJECT_SIZE") {
-      info->content_len = std::atoi(value.c_str());
-    } else {
+    if (name != "RGWX_OBJECT_SIZE") {
       info->attrs[name] = value;
     }
   }

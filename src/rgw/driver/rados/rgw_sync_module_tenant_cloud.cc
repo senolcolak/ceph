@@ -380,7 +380,8 @@ public:
   int operate(const DoutPrefixProvider* dpp) override
   {
     reenter(this) {
-      if (config_result < 0 || !config || !pipe_matches || !provider ||
+      if (!sync || !sync->env || config_result < 0 || !config ||
+          !pipe_matches || !provider ||
           sync->source_zone.id != config->source_zone_id ||
           key.need_to_encode_instance() ||
           !key.ns.empty()) {

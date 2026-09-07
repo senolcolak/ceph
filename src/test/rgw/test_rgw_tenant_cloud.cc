@@ -2,14 +2,18 @@
 // vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include <cerrno>
+#include <cstdio>
 #include <optional>
 #include <string>
 #include <utility>
+
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
 #include "rgw_tenant_cloud.h"
 #include "rgw_tenant_cloud_credentials.h"
+#include "rgw_vault_client.h"
 
 namespace tc = rgw::tenant_cloud;
 
@@ -236,6 +240,51 @@ TEST(RGWTenantCloud, rejects_empty_or_missing_credential_output)
     R"({"version":1,"access_key_id":"AKIA","secret_key":"secret"})");
   EXPECT_EQ(-EINVAL,
             tc::parse_vault_credentials(missing_envelope, &credentials));
+}
+
+TEST(RGWVaultClient, RejectsEmptyTokenFile)
+{
+  char path[] = "/tmp/rgw-vault-empty-token-XXXXXX";
+  const int fd = mkstemp(path);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(0, close(fd));
+
+  std::string token = "stale";
+  EXPECT_EQ(-EACCES, rgw::vault::testing::load_token(path, &token));
+  EXPECT_TRUE(token.empty());
+  EXPECT_EQ(0, std::remove(path));
+}
+
+TEST(RGWVaultClient, RejectsWhitespaceOnlyTokenFile)
+{
+  char path[] = "/tmp/rgw-vault-whitespace-token-XXXXXX";
+  const int fd = mkstemp(path);
+  ASSERT_GE(fd, 0);
+  constexpr std::string_view contents = " \t\n";
+  ASSERT_EQ(static_cast<ssize_t>(contents.size()),
+            write(fd, contents.data(), contents.size()));
+  ASSERT_EQ(0, close(fd));
+
+  std::string token = "stale";
+  EXPECT_EQ(-EACCES, rgw::vault::testing::load_token(path, &token));
+  EXPECT_TRUE(token.empty());
+  EXPECT_EQ(0, std::remove(path));
+}
+
+TEST(RGWVaultClient, ReturnsZeroForValidToken)
+{
+  char path[] = "/tmp/rgw-vault-token-XXXXXX";
+  const int fd = mkstemp(path);
+  ASSERT_GE(fd, 0);
+  constexpr std::string_view contents = "token-value\n";
+  ASSERT_EQ(static_cast<ssize_t>(contents.size()),
+            write(fd, contents.data(), contents.size()));
+  ASSERT_EQ(0, close(fd));
+
+  std::string token;
+  EXPECT_EQ(0, rgw::vault::testing::load_token(path, &token));
+  EXPECT_EQ("token-value", token);
+  EXPECT_EQ(0, std::remove(path));
 }
 
 } // anonymous namespace

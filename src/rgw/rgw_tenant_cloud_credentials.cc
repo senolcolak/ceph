@@ -78,6 +78,13 @@ CredentialCache::Generation CredentialCache::get_generation(
   const std::string& key)
 {
   std::lock_guard guard(lock);
+  for (auto i = generations.begin(); i != generations.end();) {
+    if (i->second.expired()) {
+      i = generations.erase(i);
+    } else {
+      ++i;
+    }
+  }
   auto& weak = generations[key];
   auto state = weak.lock();
   if (!state) {
@@ -155,13 +162,14 @@ std::optional<uint64_t> CredentialCache::put(
 void CredentialCache::invalidate(const std::string& key)
 {
   std::lock_guard guard(lock);
-  auto& weak = generations[key];
-  auto state = weak.lock();
-  if (!state) {
-    state = std::make_shared<uint64_t>(0);
-    weak = state;
+  auto generation = generations.find(key);
+  if (generation != generations.end()) {
+    if (auto state = generation->second.lock()) {
+      ++*state;
+    } else {
+      generations.erase(generation);
+    }
   }
-  ++*state;
   auto i = entries.find(key);
   if (i == entries.end()) {
     return;

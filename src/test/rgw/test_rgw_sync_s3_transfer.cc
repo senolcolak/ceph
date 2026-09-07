@@ -213,11 +213,59 @@ TEST(RGWSyncS3Transfer, DecodesSourceObjectHeaders)
   EXPECT_EQ(0u, object.attrs.count("RGWX_OBJECT_SIZE"));
 }
 
+TEST(RGWSyncS3Transfer, DecodesLargeSourceObjectSize)
+{
+  std::map<std::string, bufferlist> attrs;
+  std::map<std::string, std::string> headers{
+    {"RGWX_OBJECT_SIZE", "5368709120"},
+  };
+  rgw_rest_obj object;
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+
+  ASSERT_EQ(0, s3::decode_rest_obj(&dpp, attrs, headers, &object));
+  EXPECT_EQ(5368709120ULL, object.content_len);
+}
+
+TEST(RGWSyncS3Transfer, RejectsMissingSourceObjectSize)
+{
+  std::map<std::string, bufferlist> attrs;
+  std::map<std::string, std::string> headers{
+    {"CONTENT_TYPE", "application/octet-stream"},
+  };
+  rgw_rest_obj object;
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+
+  EXPECT_EQ(-EIO, s3::decode_rest_obj(&dpp, attrs, headers, &object));
+}
+
+TEST(RGWSyncS3Transfer, RejectsInvalidSourceObjectSize)
+{
+  std::map<std::string, bufferlist> attrs;
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+
+  for (const auto* value : {"", "not-a-size", "-1",
+                            "18446744073709551616"}) {
+    std::map<std::string, std::string> headers{
+      {"RGWX_OBJECT_SIZE", value},
+    };
+    rgw_rest_obj object;
+    object.content_len = 17;
+    object.attrs.emplace("existing", "value");
+    EXPECT_EQ(-EIO, s3::decode_rest_obj(&dpp, attrs, headers, &object))
+      << "value=" << value;
+    EXPECT_EQ(17u, object.content_len);
+    EXPECT_EQ(1u, object.attrs.size());
+    EXPECT_EQ("value", object.attrs.at("existing"));
+  }
+}
+
 TEST(RGWSyncS3Transfer, RejectsCorruptSourceAcl)
 {
   std::map<std::string, bufferlist> attrs;
   attrs[RGW_ATTR_ACL].append("not-an-encoded-acl");
-  std::map<std::string, std::string> headers;
+  std::map<std::string, std::string> headers{
+    {"RGWX_OBJECT_SIZE", "0"},
+  };
   rgw_rest_obj object;
   NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
 
