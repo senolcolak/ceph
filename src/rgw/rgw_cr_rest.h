@@ -331,6 +331,8 @@ class RGWDeleteRESTResourceCR : public RGWSimpleCoroutine {
   RGWHTTPManager *http_manager;
   std::string path;
   param_vec_t params;
+  bool *not_found{nullptr};
+  int *http_status{nullptr};
 
   boost::intrusive_ptr<RGWRESTDeleteResource> http_op;
 
@@ -338,9 +340,12 @@ public:
   RGWDeleteRESTResourceCR(CephContext *_cct, RGWRESTConn *_conn,
                         RGWHTTPManager *_http_manager,
                         const std::string& _path,
-                        rgw_http_param_pair *_params)
+                        rgw_http_param_pair *_params,
+                        bool *_not_found = nullptr,
+                        int *_http_status = nullptr)
     : RGWSimpleCoroutine(_cct, NUM_ENPOINT_IOERROR_RETRIES), conn(_conn), http_manager(_http_manager),
-      path(_path), params(make_param_list(_params))
+      path(_path), params(make_param_list(_params)), not_found(_not_found),
+      http_status(_http_status)
   {}
 
   ~RGWDeleteRESTResourceCR() override {
@@ -369,6 +374,12 @@ public:
     auto dpp = NoDoutPrefix{cct, ceph_subsys_rgw};
     bufferlist bl;
     int ret = http_op->wait(&dpp, &bl, null_yield);
+    if (not_found) {
+      *not_found = (http_op->get_http_status() == 404);
+    }
+    if (http_status) {
+      *http_status = http_op->get_http_status();
+    }
     auto op = std::move(http_op); // release ref on return
     if (ret < 0) {
       error_stream << "http operation failed: " << op->to_str()
@@ -569,6 +580,11 @@ public:
 
   void set_req(RGWHTTPStreamRWRequest *r) {
     req = r;
+  }
+
+  int get_http_status() const
+  {
+    return req ? req->get_http_status() : 0;
   }
 
   void set_multipart(const std::string& upload_id, int part_num, uint64_t part_size) {

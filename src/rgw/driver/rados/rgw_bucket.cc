@@ -11,6 +11,7 @@
 #include "rgw_bucket.h"
 #include "rgw_op.h"
 #include "rgw_bucket_sync.h"
+#include "rgw_tenant_cloud.h"
 
 #include "services/svc_zone.h"
 #include "services/svc_bucket.h"
@@ -3043,8 +3044,24 @@ int RGWBucketInstanceMetadataHandler::put(std::string& entry, RGWMetadataObject*
   // write updated instance
   RGWBucketInfo* old_info = (old ? &old->info : nullptr);
   auto mtime = obj->get_mtime();
+  // Retry activation only when replaying the same metadata version.
+  std::optional<rgw::tenant_cloud::Config> tenant_cloud_config;
+  if (bci.attrs.contains(rgw::tenant_cloud::config_attr)) {
+    ret = rgw::tenant_cloud::decode_config(bci.attrs, &tenant_cloud_config);
+    if (ret < 0) {
+      return ret;
+    }
+  }
+  const bool same_metadata_version =
+    old && old->info.objv_tracker.write_version ==
+      bci.info.objv_tracker.write_version;
+  const bool tenant_cloud_activation =
+    tenant_cloud_config && tenant_cloud_config->enabled &&
+    (!old || !old->attrs.contains(rgw::tenant_cloud::config_attr) ||
+     same_metadata_version);
   ret = svc_bucket->store_bucket_instance_info(entry, bci.info, old_info, false,
-                                               mtime, &bci.attrs, y, dpp);
+                                               mtime, &bci.attrs, y, dpp,
+                                               tenant_cloud_activation);
   if (ret < 0) {
     return ret;
   }
@@ -3453,7 +3470,8 @@ int RGWBucketCtl::store_bucket_instance_info(const rgw_bucket& bucket,
                                                 params.mtime,
                                                 params.attrs,
                                                 y,
-                                                dpp);
+                                                dpp,
+                                                params.tenant_cloud_activation);
 }
 
 int RGWBucketCtl::remove_bucket_instance_info(const rgw_bucket& bucket,
@@ -3879,4 +3897,3 @@ void RGWBucketEntryPoint::decode_json(JSONObj *obj) {
     JSONDecoder::decode_json("old_bucket_info", old_bucket_info, obj);
   }
 }
-

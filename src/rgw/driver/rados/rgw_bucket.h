@@ -578,6 +578,7 @@ public:
       bool exclusive{false};
       const std::map<std::string, bufferlist> *attrs{nullptr};
       RGWObjVersionTracker *objv_tracker{nullptr};
+      bool tenant_cloud_activation{false};
 
       PutParams() {}
 
@@ -603,6 +604,11 @@ public:
 
       PutParams& set_objv_tracker(RGWObjVersionTracker *_objv_tracker) {
         objv_tracker = _objv_tracker;
+        return *this;
+      }
+
+      PutParams& set_tenant_cloud_activation(bool value) {
+        tenant_cloud_activation = value;
         return *this;
       }
     };

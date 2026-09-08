@@ -185,13 +185,14 @@ void RGWHTTPSimpleRequest::get_out_headers(map<string, string> *pheaders)
   out_headers.clear();
 }
 
-static int sign_request_v2(const DoutPrefixProvider *dpp, const RGWAccessKey& key,
+static int sign_request_v2(const DoutPrefixProvider *dpp,
+                        const RGWOutboundCredentials& credentials,
                         const string& region, const string& service,
                         RGWEnv& env, req_info& info,
                         const bufferlist *opt_content)
 {
   /* don't sign if no key is provided */
-  if (key.key.empty()) {
+  if (credentials.secret_key.empty()) {
     return 0;
   }
 
@@ -209,30 +210,31 @@ static int sign_request_v2(const DoutPrefixProvider *dpp, const RGWAccessKey& ke
     return -EINVAL;
   }
 
-  ldpp_dout(dpp, 10) << "generated canonical header: " << canonical_header << dendl;
+  ldpp_dout(dpp, 10) << "generated S3 canonical header" << dendl;
 
   string digest;
   try {
-    digest = rgw::auth::s3::get_v2_signature(cct, key.key, canonical_header);
+    digest = rgw::auth::s3::get_v2_signature(cct, credentials.secret_key, canonical_header);
   } catch (int ret) {
     return ret;
   }
 
-  string auth_hdr = "AWS " + key.id + ":" + digest;
-  ldpp_dout(dpp, 15) << "generated auth header: " << auth_hdr << dendl;
+  string auth_hdr = "AWS " + credentials.access_key_id + ":" + digest;
+  ldpp_dout(dpp, 15) << "generated S3 authorization header" << dendl;
 
   env.set("AUTHORIZATION", auth_hdr);
 
   return 0;
 }
 
-static int sign_request_v4(const DoutPrefixProvider *dpp, const RGWAccessKey& key,
+static int sign_request_v4(const DoutPrefixProvider *dpp,
+                           const RGWOutboundCredentials& credentials,
                            const string& region, const string& service,
                            RGWEnv& env, req_info& info,
                            const bufferlist *opt_content)
 {
   /* don't sign if no key is provided */
-  if (key.key.empty()) {
+  if (credentials.secret_key.empty()) {
     return 0;
   }
 
@@ -244,23 +246,30 @@ static int sign_request_v4(const DoutPrefixProvider *dpp, const RGWAccessKey& ke
     }
   }
 
+  if (credentials.session_token) {
+    env.set("HTTP_X_AMZ_SECURITY_TOKEN", *credentials.session_token);
+    info.x_meta_map["x-amz-security-token"] = *credentials.session_token;
+  }
+
   rgw::auth::s3::AWSSignerV4::prepare_result_t sigv4_data;
   if (service == "s3") {
-    sigv4_data = rgw::auth::s3::AWSSignerV4::prepare(dpp, key.id, region, service, info, opt_content, true);
+    sigv4_data = rgw::auth::s3::AWSSignerV4::prepare(dpp, credentials.access_key_id, region, service, info, opt_content, true);
   } else {
-    sigv4_data = rgw::auth::s3::AWSSignerV4::prepare(dpp, key.id, region, service, info, opt_content, false);
+    sigv4_data = rgw::auth::s3::AWSSignerV4::prepare(dpp, credentials.access_key_id, region, service, info, opt_content, false);
   }
-  auto sigv4_headers = sigv4_data.signature_factory(dpp, key.key, sigv4_data);
+  auto sigv4_headers = sigv4_data.signature_factory(dpp, credentials.secret_key, sigv4_data);
 
   for (auto& entry : sigv4_headers) {
-    ldpp_dout(dpp, 20) << __func__ << "(): sigv4 header: " << entry.first << ": " << entry.second << dendl;
+    ldpp_dout(dpp, 20) << __func__ << "(): generated SigV4 header: "
+                        << entry.first << dendl;
     env.set(entry.first, entry.second);
   }
 
   return 0;
 }
 
-static int sign_request(const DoutPrefixProvider *dpp, const RGWAccessKey& key,
+static int sign_request(const DoutPrefixProvider *dpp,
+                        const RGWOutboundCredentials& credentials,
                         const string& region, const string& service,
                         RGWEnv& env, req_info& info,
                         const bufferlist *opt_content)
@@ -268,10 +277,24 @@ static int sign_request(const DoutPrefixProvider *dpp, const RGWAccessKey& key,
   auto authv = dpp->get_cct()->_conf.get_val<int64_t>("rgw_s3_client_max_sig_ver");
   if (authv > 0 &&
       authv <= 3) {
-    return sign_request_v2(dpp, key, region, service, env, info, opt_content);
+    if (credentials.session_token) {
+      // SigV2 has no supported temporary-credential representation in the
+      // outbound client. Never send an unsigned session token.
+      return -EOPNOTSUPP;
+    }
+    return sign_request_v2(dpp, credentials, region, service, env, info, opt_content);
   }
 
-  return sign_request_v4(dpp, key, region, service, env, info, opt_content);
+  return sign_request_v4(dpp, credentials, region, service, env, info, opt_content);
+}
+
+static int sign_request(const DoutPrefixProvider *dpp, const RGWAccessKey& key,
+                        const string& region, const string& service,
+                        RGWEnv& env, req_info& info,
+                        const bufferlist *opt_content)
+{
+  return sign_request(dpp, RGWOutboundCredentials(key), region, service,
+                      env, info, opt_content);
 }
 
 static string extract_region_name(string&& s)
@@ -672,15 +695,24 @@ void RGWRESTGenerateHTTPHeaders::set_policy(const RGWAccessControlPolicy& policy
   add_grants_headers(grants_by_type, *new_env, new_info->x_meta_map);
 }
 
-int RGWRESTGenerateHTTPHeaders::sign(const DoutPrefixProvider *dpp, RGWAccessKey& key, const bufferlist *opt_content)
+int RGWRESTGenerateHTTPHeaders::sign(const DoutPrefixProvider *dpp,
+                                     const RGWOutboundCredentials& credentials,
+                                     const bufferlist *opt_content)
 {
-  int ret = sign_request(dpp, key, region, service, *new_env, *new_info, opt_content);
+  int ret = sign_request(dpp, credentials, region, service, *new_env, *new_info, opt_content);
   if (ret < 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to sign request" << dendl;
     return ret;
   }
 
   return 0;
+}
+
+int RGWRESTGenerateHTTPHeaders::sign(const DoutPrefixProvider *dpp,
+                                     RGWAccessKey& key,
+                                     const bufferlist *opt_content)
+{
+  return sign(dpp, RGWOutboundCredentials(key), opt_content);
 }
 
 void RGWRESTStreamS3PutObj::send_init(const rgw_obj& obj)
@@ -717,7 +749,15 @@ void RGWRESTStreamS3PutObj::send_ready(const DoutPrefixProvider *dpp, RGWAccessK
 {
   headers_gen.set_obj_attrs(dpp, rgw_attrs);
 
-  send_ready(dpp, key);
+  send_ready(dpp, RGWOutboundCredentials(key));
+}
+
+void RGWRESTStreamS3PutObj::send_ready(const DoutPrefixProvider *dpp,
+                                       const RGWOutboundCredentials& credentials,
+                                       map<string, bufferlist>& rgw_attrs)
+{
+  headers_gen.set_obj_attrs(dpp, rgw_attrs);
+  send_ready(dpp, credentials);
 }
 
 void RGWRESTStreamS3PutObj::send_ready(const DoutPrefixProvider *dpp, RGWAccessKey& key, const map<string, string>& http_attrs,
@@ -726,12 +766,23 @@ void RGWRESTStreamS3PutObj::send_ready(const DoutPrefixProvider *dpp, RGWAccessK
   headers_gen.set_http_attrs(http_attrs);
   headers_gen.set_policy(policy);
 
-  send_ready(dpp, key);
+  send_ready(dpp, RGWOutboundCredentials(key));
 }
 
-void RGWRESTStreamS3PutObj::send_ready(const DoutPrefixProvider *dpp, RGWAccessKey& key)
+void RGWRESTStreamS3PutObj::send_ready(const DoutPrefixProvider *dpp,
+                                       const RGWOutboundCredentials& credentials,
+                                       const map<string, string>& http_attrs,
+                                       RGWAccessControlPolicy& policy)
 {
-  headers_gen.sign(dpp, key, nullptr);
+  headers_gen.set_http_attrs(http_attrs);
+  headers_gen.set_policy(policy);
+  send_ready(dpp, credentials);
+}
+
+void RGWRESTStreamS3PutObj::send_ready(const DoutPrefixProvider *dpp,
+                                       const RGWOutboundCredentials& credentials)
+{
+  prepare_result = headers_gen.sign(dpp, credentials, nullptr);
 
   for (const auto& kv: new_env.get_map()) {
     headers.emplace_back(kv);
@@ -740,10 +791,30 @@ void RGWRESTStreamS3PutObj::send_ready(const DoutPrefixProvider *dpp, RGWAccessK
   out_cb = new RGWRESTStreamOutCB(this);
 }
 
+int RGWRESTStreamS3PutObj::send(RGWHTTPManager* mgr)
+{
+  return prepare_result < 0 ? prepare_result :
+                              RGWHTTPStreamRWRequest::send(mgr);
+}
+
+void RGWRESTStreamS3PutObj::send_ready(const DoutPrefixProvider *dpp, RGWAccessKey& key)
+{
+  send_ready(dpp, RGWOutboundCredentials(key));
+}
+
 void RGWRESTStreamS3PutObj::put_obj_init(const DoutPrefixProvider *dpp, RGWAccessKey& key, const rgw_obj& obj, map<string, bufferlist>& attrs)
 {
   send_init(obj);
   send_ready(dpp, key, attrs);
+}
+
+void RGWRESTStreamS3PutObj::put_obj_init(const DoutPrefixProvider *dpp,
+                                         const RGWOutboundCredentials& credentials,
+                                         const rgw_obj& obj,
+                                         map<string, bufferlist>& attrs)
+{
+  send_init(obj);
+  send_ready(dpp, credentials, attrs);
 }
 
 void set_str_from_headers(map<string, string>& out_headers, const string& header_name, string& str)
@@ -804,12 +875,38 @@ int RGWRESTStreamRWRequest::send_request(const DoutPrefixProvider *dpp, RGWAcces
   return send_request(dpp, &key, extra_headers, resource, mgr);
 }
 
+int RGWRESTStreamRWRequest::send_request(const DoutPrefixProvider *dpp, const RGWOutboundCredentials& credentials, map<string, string>& extra_headers, const rgw_obj& obj, RGWHTTPManager *mgr)
+{
+  string resource;
+  send_prepare_convert(obj, &resource);
+  return send_request(dpp, credentials, extra_headers, resource, mgr);
+}
+
 int RGWRESTStreamRWRequest::send_prepare(const DoutPrefixProvider *dpp, RGWAccessKey& key, map<string, string>& extra_headers, const rgw_obj& obj)
 {
   string resource;
   send_prepare_convert(obj, &resource);
 
-  return do_send_prepare(dpp, &key, extra_headers, resource);
+  const RGWOutboundCredentials credentials(key);
+  return do_send_prepare(dpp, &credentials, extra_headers, resource);
+}
+
+int RGWRESTStreamRWRequest::send_prepare(const DoutPrefixProvider *dpp, const RGWOutboundCredentials& credentials, map<string, string>& extra_headers, const rgw_obj& obj)
+{
+  string resource;
+  send_prepare_convert(obj, &resource);
+  return do_send_prepare(dpp, &credentials, extra_headers, resource);
+}
+
+int RGWRESTStreamRWRequest::send_prepare(const DoutPrefixProvider *dpp,
+                                         const RGWOutboundCredentials& credentials,
+                                         map<string, string>& extra_headers,
+                                         const string& resource,
+                                         bufferlist *send_data)
+{
+  string new_resource;
+  url_encode(resource, new_resource, false);
+  return do_send_prepare(dpp, &credentials, extra_headers, new_resource, send_data);
 }
 
 int RGWRESTStreamRWRequest::send_prepare(const DoutPrefixProvider *dpp, RGWAccessKey *key, map<string, string>& extra_headers, const string& resource,
@@ -819,10 +916,14 @@ int RGWRESTStreamRWRequest::send_prepare(const DoutPrefixProvider *dpp, RGWAcces
   //do not encode slash
   url_encode(resource, new_resource, false);
 
-  return do_send_prepare(dpp, key, extra_headers, new_resource, send_data);
+  if (key) {
+    const RGWOutboundCredentials credentials(*key);
+    return do_send_prepare(dpp, &credentials, extra_headers, new_resource, send_data);
+  }
+  return do_send_prepare(dpp, nullptr, extra_headers, new_resource, send_data);
 }
 
-int RGWRESTStreamRWRequest::do_send_prepare(const DoutPrefixProvider *dpp, RGWAccessKey *key, map<string, string>& extra_headers, const string& resource,
+int RGWRESTStreamRWRequest::do_send_prepare(const DoutPrefixProvider *dpp, const RGWOutboundCredentials *credentials, map<string, string>& extra_headers, const string& resource,
                                          bufferlist *send_data)
 {
   RGWEndpoint new_endpoint = endpoint;
@@ -869,8 +970,9 @@ int RGWRESTStreamRWRequest::do_send_prepare(const DoutPrefixProvider *dpp, RGWAc
 
   headers_gen->set_http_attrs(extra_headers);
 
-  if (key) {
-    sign_key = *key;
+  sign_credentials.reset();
+  if (credentials) {
+    sign_credentials = *credentials;
   }
 
   if (send_data) {
@@ -896,6 +998,17 @@ int RGWRESTStreamRWRequest::send_request(const DoutPrefixProvider *dpp, RGWAcces
   return send(mgr);
 }
 
+int RGWRESTStreamRWRequest::send_request(const DoutPrefixProvider *dpp,
+                                         const RGWOutboundCredentials& credentials,
+                                         map<string, string>& extra_headers,
+                                         const string& resource,
+                                         RGWHTTPManager *mgr,
+                                         bufferlist *send_data)
+{
+  int ret = send_prepare(dpp, credentials, extra_headers, resource, send_data);
+  return ret < 0 ? ret : send(mgr);
+}
+
 
 int RGWRESTStreamRWRequest::send(RGWHTTPManager *mgr)
 {
@@ -910,8 +1023,8 @@ int RGWRESTStreamRWRequest::send(RGWHTTPManager *mgr)
     outblp = &outbl;
   }
 
-  if (sign_key) {
-    int r = headers_gen->sign(this, *sign_key, outblp);
+  if (sign_credentials) {
+    int r = headers_gen->sign(this, *sign_credentials, outblp);
     if (r < 0) {
       ldpp_dout(this, 0) << "ERROR: failed to sign request" << dendl;
       return r;

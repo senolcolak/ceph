@@ -9,6 +9,7 @@
 #include "rgw_bucket.h"
 
 #include "rgw_sync_module_log.h"
+#include "rgw_sync_module_tenant_cloud.h"
 #include "rgw_sync_module_es.h"
 #include "rgw_sync_module_aws.h"
 
@@ -93,4 +94,8 @@ void rgw_register_sync_modules(RGWSyncModulesManager *modules_manager)
 
   RGWSyncModuleRef aws_module(std::make_shared<RGWAWSSyncModule>());
   modules_manager->register_module("cloud", aws_module);
+
+  RGWSyncModuleRef tenant_cloud_module(
+    std::make_shared<RGWTenantCloudSyncModule>());
+  modules_manager->register_module("tenant-cloud", tenant_cloud_module);
 }

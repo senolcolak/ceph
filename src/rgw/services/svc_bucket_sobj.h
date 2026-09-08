@@ -140,7 +140,8 @@ public:
                                  real_time mtime,
                                  const std::map<std::string, bufferlist> *pattrs,
                                  optional_yield y,
-                                 const DoutPrefixProvider *dpp) override;
+                                 const DoutPrefixProvider *dpp,
+                                 bool tenant_cloud_activation = false) override;
 
   int remove_bucket_instance_info(const std::string& key,
                                   const RGWBucketInfo& bucket_info,
@@ -157,4 +158,3 @@ public:
                          optional_yield y,
                          const DoutPrefixProvider *dpp) override;
 };
-

@@ -979,6 +979,16 @@ class Bucket {
                       optional_yield y) = 0;
     /** Store the cached bucket info into the backing store */
     virtual int put_info(const DoutPrefixProvider* dpp, bool exclusive, ceph::real_time mtime, optional_yield y) = 0;
+    virtual int put_info_with_activation(const DoutPrefixProvider* dpp,
+                                         bool exclusive,
+                                         ceph::real_time mtime,
+                                         optional_yield y,
+                                         bool tenant_cloud_activation) {
+      if (tenant_cloud_activation) {
+        return -EOPNOTSUPP;
+      }
+      return put_info(dpp, exclusive, mtime, y);
+    }
     /** Get the owner of this bucket */
     virtual const rgw_owner& get_owner() const = 0;
     /** Check in the backing store if this bucket is empty */

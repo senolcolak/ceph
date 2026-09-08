@@ -1426,6 +1426,59 @@ public:
   int operate(const DoutPrefixProvider *dpp) override;
 };
 
+namespace rgw::data_sync {
+namespace {
+
+class PersistRetryBeforeMarkerCR final : public RGWCoroutine {
+  std::unique_ptr<RGWCoroutine> retry_write;
+  std::unique_ptr<RGWCoroutine> marker_write;
+  MarkerFinishFactory finish_marker;
+
+public:
+  PersistRetryBeforeMarkerCR(CephContext* cct, RGWCoroutine* retry_write,
+                             MarkerFinishFactory finish_marker)
+    : RGWCoroutine(cct), retry_write(retry_write),
+      finish_marker(std::move(finish_marker))
+  {
+  }
+
+  int operate(const DoutPrefixProvider*) override
+  {
+    reenter(this) {
+      if (!retry_write) {
+        return set_cr_error(-EINVAL);
+      }
+      yield call(retry_write.release());
+      if (retcode < 0) {
+        return set_cr_error(retcode);
+      }
+      if (finish_marker) {
+        marker_write.reset(finish_marker());
+        if (marker_write) {
+          yield call(marker_write.release());
+          if (retcode < 0) {
+            return set_cr_error(retcode);
+          }
+        }
+      }
+      return set_cr_done();
+    }
+    return 0;
+  }
+};
+
+} // anonymous namespace
+
+RGWCoroutine* persist_retry_before_marker(
+    CephContext* cct, RGWCoroutine* retry_write,
+    MarkerFinishFactory finish_marker)
+{
+  return new PersistRetryBeforeMarkerCR(
+      cct, retry_write, std::move(finish_marker));
+}
+
+} // namespace rgw::data_sync
+
 class RGWDataSyncSingleEntryCR : public RGWCoroutine {
   RGWDataSyncCtx *sc;
   RGWDataSyncEnv *sync_env;
@@ -1527,12 +1580,25 @@ public:
         }
         if (complete->timestamp != ceph::real_time{}) {
           tn->log(10, SSTR("writing " << *complete << " to error repo for retry"));
-          yield call(rgw::error_repo::write_cr(sync_env->driver->getRados()->get_rados_handle(), error_repo,
-                                              rgw::error_repo::encode_key(complete->bs, complete->gen),
-                                              complete->timestamp));
+          yield call(rgw::data_sync::persist_retry_before_marker(
+            cct,
+            rgw::error_repo::write_cr(
+              sync_env->driver->getRados()->get_rados_handle(), error_repo,
+              rgw::error_repo::encode_key(complete->bs, complete->gen),
+              complete->timestamp),
+            [this] {
+              if (marker_tracker && !complete->marker.empty()) {
+                return marker_tracker->finish(complete->marker);
+              }
+              return static_cast<RGWCoroutine*>(nullptr);
+            }));
           if (retcode < 0) {
-            tn->log(0, SSTR("ERROR: failed to log sync failure in error repo: retcode=" << retcode));
+            tn->log(0, SSTR("ERROR: failed to persist retry ownership or "
+                            "finish its data-log marker: retcode="
+                            << retcode));
+            return set_cr_error(retcode);
           }
+          return set_cr_error(sync_status);
         }
       } else if (complete->retry) {
         yield call(rgw::error_repo::remove_cr(sync_env->driver->getRados()->get_rados_handle(), error_repo,
@@ -1575,6 +1641,7 @@ class RGWDataIncrementalSyncFullObligationCR: public RGWCoroutine {
   RGWDataSyncEnv *sync_env;
   rgw_bucket_shard source_bs;
   rgw_raw_obj error_repo;
+  rgw_raw_obj shard_error_repo;
   std::string error_marker;
   ceph::real_time timestamp;
   RGWSyncTraceNodeRef tn;
@@ -1583,6 +1650,7 @@ class RGWDataIncrementalSyncFullObligationCR: public RGWCoroutine {
   uint32_t sid;
   rgw_bucket_shard bs;
   std::vector<store_gen_shards>::const_iterator each;
+  int retry_write_error = 0;
 
 public:
   RGWDataIncrementalSyncFullObligationCR(RGWDataSyncCtx *_sc, rgw_bucket_shard& _source_bs,
@@ -1612,25 +1680,31 @@ public:
           bs.bucket = source_bs.bucket;
           bs.shard_id = sid;
 	  pool = sync_env->svc->zone->get_zone_params().log_pool;
-          error_repo = datalog_oid_for_error_repo(sc, sync_env->driver, pool, source_bs);
+          shard_error_repo =
+            datalog_oid_for_error_repo(sc, sync_env->driver, pool, bs);
           tn->log(10, SSTR("writing shard_id " << sid << " of gen " << each->gen << " to error repo for retry"));
-          yield_spawn_window(rgw::error_repo::write_cr(sync_env->driver->getRados()->get_rados_handle(), error_repo,
+          yield_spawn_window(rgw::error_repo::write_cr(sync_env->driver->getRados()->get_rados_handle(), shard_error_repo,
                             rgw::error_repo::encode_key(bs, each->gen),
 			    timestamp), sc->lcc.adj_concurrency(cct->_conf->rgw_data_sync_spawn_window),
                             [&](uint64_t stack_id, int ret) {
                               if (ret < 0) {
-                                retcode = ret;
+                                retry_write_error = ret;
                               }
                               return 0;
                             });
         }
       }
       drain_all_cb([&](uint64_t stack_id, int ret) {
-                   if (ret < 0) {
-                     tn->log(10, SSTR("writing to error repo returned error: " << ret));
-                   }
-                   return ret;
-                 });
+        if (ret < 0 && retry_write_error == 0) {
+          retry_write_error = ret;
+          tn->log(10, SSTR("writing to error repo returned error: " << ret));
+        }
+        return ret;
+      });
+
+      if (retry_write_error < 0) {
+        return set_cr_error(retry_write_error);
+      }
 
       // once everything succeeds, remove the full sync obligation from the error repo
       yield call(rgw::error_repo::remove_cr(sync_env->driver->getRados()->get_rados_handle(), error_repo,
@@ -1656,7 +1730,7 @@ RGWCoroutine* data_sync_single_entry(RGWDataSyncCtx *sc, const rgw_bucket_shard&
   auto gen_state = bucket_gen_cache->get(src.bucket.get_key(), gen);
   auto obligation = rgw_data_sync_obligation{src, gen, marker, timestamp, retry};
   return new RGWDataSyncSingleEntryCR(sc, std::move(state), std::move(gen_state), std::move(obligation),
-                                      &*marker_tracker, error_repo,
+                                      marker_tracker, error_repo,
                                       lease_cr.get(), tn);
 }
 
@@ -1692,6 +1766,7 @@ class RGWDataFullSyncSingleEntryCR : public RGWCoroutine {
   RGWCoroutine* shard_cr = nullptr;
   bool first_shard = true;
   bool error_inject;
+  int sync_error = 0;
 
 public:
   RGWDataFullSyncSingleEntryCR(RGWDataSyncCtx *_sc, const rgw_pool& _pool, const rgw_bucket_shard& _source_bs,
@@ -1720,6 +1795,7 @@ public:
       }
 
       if (retcode < 0) {
+        sync_error = retcode;
         tn->log(10, SSTR("full sync: failed to read remote bucket info. Writing "
                         << source_bs.shard_id << " to error repo for retry"));
         yield call(rgw::error_repo::write_cr(sync_env->driver->getRados()->get_rados_handle(), error_repo,
@@ -1727,9 +1803,15 @@ public:
                                             timestamp));
         if (retcode < 0) {
           tn->log(0, SSTR("ERROR: failed to log " << source_bs.shard_id << " in error repo: retcode=" << retcode));
+          return set_cr_error(retcode);
         }
-        yield call(marker_tracker->finish(key));
-        return set_cr_error(retcode);
+        if (marker_tracker) {
+          yield call(marker_tracker->finish(key));
+          if (retcode < 0) {
+            return set_cr_error(retcode);
+          }
+        }
+        return set_cr_error(sync_error);
       }
 
       //wait to sync the first shard of the oldest generation and then sync all other shards.
@@ -1777,10 +1859,15 @@ public:
               });
       }
 
-      yield call(marker_tracker->finish(key));
       if (retcode < 0) {
+        return set_cr_error(retcode);
+      }
+      if (marker_tracker) {
+        yield call(marker_tracker->finish(key));
+        if (retcode < 0) {
           return set_cr_error(retcode);
         }
+      }
 
       return set_cr_done();
     }
@@ -1848,6 +1935,7 @@ class RGWDataFullSyncShardCR : public RGWDataBaseSyncShardCR {
   string error_marker;
   bool lost_lock = false;
   bool lost_bid = false;
+  int parse_ret = 0;
 
 public:
 
@@ -1899,8 +1987,8 @@ public:
         tn->log(20, SSTR("retrieved " << entries.size() << " entries to sync"));
         iter = entries.begin();
         for (; iter != entries.end(); ++iter) {
-          retcode = parse_bucket_key(iter->first, source_bs);
-          if (retcode < 0) {
+          parse_ret = parse_bucket_key(iter->first, source_bs);
+          if (parse_ret < 0) {
             tn->log(1, SSTR("failed to parse bucket shard: " << iter->first));
             marker_tracker->try_update_high_marker(iter->first, 0,
 						   entry_timestamp);
@@ -1928,6 +2016,10 @@ public:
       omapvals.reset();
 
       drain_all();
+
+      if (retcode < 0) {
+        return set_cr_error(retcode);
+      }
 
       tn->unset_flag(RGW_SNS_FLAG_ACTIVE);
 
