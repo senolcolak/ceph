@@ -88,7 +88,8 @@ bool prohibited_v6(const boost::asio::ip::address_v6& address)
        bytes[3] == 0xb8) ||
       (bytes[0] == 0x20 && bytes[1] == 0x02) ||
       // 3fff::/20 is reserved for documentation (RFC 9637).
-      (bytes[0] == 0x3f && (bytes[1] & 0xf0) == 0xf0)) {
+      (bytes[0] == 0x3f && bytes[1] == 0xff &&
+       (bytes[2] & 0xf0) == 0x00)) {
     return true;
   }
   return false;

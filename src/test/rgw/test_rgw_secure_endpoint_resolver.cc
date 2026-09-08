@@ -44,7 +44,11 @@ TEST(RGWSecureEndpoint, rejectsSpecialAddresses)
   for (const auto* value : {"::", "::1", "100::1", "fe80::1",
                             "fec0::1", "fc00::1", "ff02::1",
                             "2001:2::1", "2001:db8::1", "2002::1",
-                            "3fff::1", "3fff:ffff::1",
+                            "3fff::1", "3fff:0fff:ffff::1",
+                            "64:ff9b::a9fe:a9fe",
+                            "64:ff9b::5db8:d822",
+                            "2002:a9fe:a9fe::1",
+                            "2002:5db8:d822::1",
                             "::ffff:127.0.0.1"}) {
     boost::system::error_code ec;
     auto address = boost::asio::ip::make_address(value, ec);
@@ -52,9 +56,11 @@ TEST(RGWSecureEndpoint, rejectsSpecialAddresses)
     EXPECT_TRUE(policy::is_prohibited_address(address)) << value;
   }
   boost::system::error_code ec;
-  const auto adjacent = boost::asio::ip::make_address("3fef:ffff::1", ec);
-  ASSERT_FALSE(ec);
-  EXPECT_FALSE(policy::is_prohibited_address(adjacent));
+  for (const auto* value : {"3ffe:ffff::1", "3fff:1000::1"}) {
+    const auto adjacent = boost::asio::ip::make_address(value, ec);
+    ASSERT_FALSE(ec);
+    EXPECT_FALSE(policy::is_prohibited_address(adjacent)) << value;
+  }
 }
 
 TEST(RGWSecureEndpoint, rejectsPrivateAndSpecialAddresses)
