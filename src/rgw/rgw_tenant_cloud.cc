@@ -168,6 +168,24 @@ void encode_config(const Config& config, Attrs* attrs)
   (*attrs)[config_attr] = std::move(bl);
 }
 
+int decode_master_state(const std::map<std::string, std::string>& headers,
+                        std::optional<bool>* enabled)
+{
+  if (!enabled) {
+    return -EINVAL;
+  }
+  enabled->reset();
+  const auto i = headers.find("X_RGW_TENANT_CLOUD_STATE");
+  if (i == headers.end()) {
+    return 0;
+  }
+  if (i->second != "0" && i->second != "1") {
+    return -EIO;
+  }
+  *enabled = i->second == "1";
+  return 0;
+}
+
 int advance_generation(const std::optional<Config>& previous, uint64_t epoch,
                        Config* next)
 {

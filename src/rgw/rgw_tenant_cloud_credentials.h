@@ -11,6 +11,7 @@
 
 namespace rgw::tenant_cloud {
 
+int validate_vault_config(const RGWVaultConfig& config);
 int parse_vault_credentials(bufferlist& response, Credentials* result);
 
 class CredentialResolver {

@@ -55,6 +55,17 @@ bool valid_header_value(std::string_view value)
 }
 }
 
+int validate_vault_config(const RGWVaultConfig& config)
+{
+  if (config.address.empty() ||
+      (config.auth != "token" && config.auth != "agent") ||
+      (config.auth == "token" && config.token_file.empty()) ||
+      config.ssl_clientcert.empty() != config.ssl_clientkey.empty()) {
+    return -EINVAL;
+  }
+  return 0;
+}
+
 CredentialCache::CredentialCache(size_t max_entries, std::chrono::seconds ttl)
   : max_entries(max_entries), ttl(ttl) {}
 
@@ -310,7 +321,7 @@ public:
 RGWCoroutine* VaultCredentialResolver::resolve(
   rgw_owner owner, Config config, Credentials* result)
 {
-  if (!cct) return nullptr;
+  if (!cct || validate_vault_config(vault_config) < 0) return nullptr;
   return new ResolveCR(cct, vault_config, std::move(owner),
                        std::move(config), result, cache);
 }

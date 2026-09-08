@@ -130,6 +130,28 @@ TEST(RGWTenantCloud, rejects_null_decode_destination)
   EXPECT_EQ(-EINVAL, tc::decode_config(attrs, nullptr));
 }
 
+TEST(RGWTenantCloud, DecodesMetadataMasterState)
+{
+  std::optional<bool> enabled = true;
+  EXPECT_EQ(0, tc::decode_master_state({}, &enabled));
+  EXPECT_FALSE(enabled.has_value());
+
+  EXPECT_EQ(0, tc::decode_master_state(
+    {{"X_RGW_TENANT_CLOUD_STATE", "0"}}, &enabled));
+  ASSERT_TRUE(enabled.has_value());
+  EXPECT_FALSE(*enabled);
+
+  EXPECT_EQ(0, tc::decode_master_state(
+    {{"X_RGW_TENANT_CLOUD_STATE", "1"}}, &enabled));
+  ASSERT_TRUE(enabled.has_value());
+  EXPECT_TRUE(*enabled);
+
+  EXPECT_EQ(-EIO, tc::decode_master_state(
+    {{"X_RGW_TENANT_CLOUD_STATE", "enabled"}}, &enabled));
+  EXPECT_FALSE(enabled.has_value());
+  EXPECT_EQ(-EINVAL, tc::decode_master_state({}, nullptr));
+}
+
 TEST(RGWTenantCloud, decodes_previous_poc_attribute_layout)
 {
   const auto expected = valid_config();
@@ -271,6 +293,32 @@ TEST(RGWVaultClient, RejectsEmptyTokenFile)
   EXPECT_EQ(-EACCES, rgw::vault::testing::load_token(path, &token));
   EXPECT_TRUE(token.empty());
   EXPECT_EQ(0, std::remove(path));
+}
+
+TEST(RGWVaultClient, ValidatesTenantCloudConfiguration)
+{
+  RGWVaultConfig config{
+    .address = "https://vault.example.test",
+    .auth = "token",
+    .token_file = "/run/ceph/vault-token",
+  };
+  EXPECT_EQ(0, tc::validate_vault_config(config));
+
+  config.address.clear();
+  EXPECT_EQ(-EINVAL, tc::validate_vault_config(config));
+  config.address = "https://vault.example.test";
+  config.auth = "unknown";
+  EXPECT_EQ(-EINVAL, tc::validate_vault_config(config));
+  config.auth = "token";
+  config.token_file.clear();
+  EXPECT_EQ(-EINVAL, tc::validate_vault_config(config));
+
+  config.auth = "agent";
+  EXPECT_EQ(0, tc::validate_vault_config(config));
+  config.ssl_clientcert = "/run/ceph/client.crt";
+  EXPECT_EQ(-EINVAL, tc::validate_vault_config(config));
+  config.ssl_clientkey = "/run/ceph/client.key";
+  EXPECT_EQ(0, tc::validate_vault_config(config));
 }
 
 TEST(RGWVaultClient, RejectsWhitespaceOnlyTokenFile)

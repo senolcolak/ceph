@@ -93,6 +93,8 @@ int validate_endpoint_policy(const CephContext* cct, const Config& config,
 
 int decode_config(const Attrs& attrs, std::optional<Config>* config);
 void encode_config(const Config& config, Attrs* attrs);
+int decode_master_state(const std::map<std::string, std::string>& headers,
+                        std::optional<bool>* enabled);
 
 int advance_generation(const std::optional<Config>& previous, uint64_t epoch,
                        Config* next);

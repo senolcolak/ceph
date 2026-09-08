@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include "common/ceph_json.h"
 #include "global/global_context.h"
 #include "rgw_bucket_sync.h"
 #include "rgw_data_sync.h"
@@ -20,6 +21,32 @@ namespace tc = rgw::tenant_cloud;
 namespace s3 = rgw::sync::s3;
 
 namespace {
+
+TEST(RGWTenantCloudSync, RejectsInvalidVaultConfigurationAtStartup)
+{
+  const auto old_address = g_ceph_context->_conf.get_val<std::string>(
+    "rgw_tenant_cloud_vault_addr");
+  const auto old_auth = g_ceph_context->_conf.get_val<std::string>(
+    "rgw_tenant_cloud_vault_auth");
+  const auto old_token_file = g_ceph_context->_conf.get_val<std::string>(
+    "rgw_tenant_cloud_vault_token_file");
+  g_ceph_context->_conf.set_val("rgw_tenant_cloud_vault_addr", "");
+  g_ceph_context->_conf.set_val("rgw_tenant_cloud_vault_auth", "token");
+  g_ceph_context->_conf.set_val("rgw_tenant_cloud_vault_token_file", "");
+
+  RGWTenantCloudSyncModule module;
+  JSONFormattable config;
+  RGWSyncModuleInstanceRef instance;
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(-EINVAL, module.create_instance(
+    &dpp, g_ceph_context, config, &instance));
+  EXPECT_FALSE(instance);
+
+  g_ceph_context->_conf.set_val("rgw_tenant_cloud_vault_addr", old_address);
+  g_ceph_context->_conf.set_val("rgw_tenant_cloud_vault_auth", old_auth);
+  g_ceph_context->_conf.set_val("rgw_tenant_cloud_vault_token_file",
+                                old_token_file);
+}
 
 class DoneCR final : public RGWCoroutine {
   int result;

@@ -851,34 +851,29 @@ int RGWTenantCloudSyncModule::create_instance(
   if (!cct || !instance) {
     return -EINVAL;
   }
-  const auto configured_or_kms = [cct](const char* tenant_option,
-                                       const char* kms_option) {
-    auto value = cct->_conf.get_val<std::string>(tenant_option);
-    if (value.empty()) {
-      value = cct->_conf.get_val<std::string>(kms_option);
-    }
-    return value;
-  };
   RGWVaultConfig vault_config{
-    .address = configured_or_kms("rgw_tenant_cloud_vault_addr",
-                                 "rgw_crypt_vault_addr"),
-    .auth = configured_or_kms("rgw_tenant_cloud_vault_auth",
-                              "rgw_crypt_vault_auth"),
-    .token_file = configured_or_kms("rgw_tenant_cloud_vault_token_file",
-                                    "rgw_crypt_vault_token_file"),
-    .namespace_name = configured_or_kms("rgw_tenant_cloud_vault_namespace",
-                                        "rgw_crypt_vault_namespace"),
+    .address = cct->_conf.get_val<std::string>(
+      "rgw_tenant_cloud_vault_addr"),
+    .auth = cct->_conf.get_val<std::string>(
+      "rgw_tenant_cloud_vault_auth"),
+    .token_file = cct->_conf.get_val<std::string>(
+      "rgw_tenant_cloud_vault_token_file"),
+    .namespace_name = cct->_conf.get_val<std::string>(
+      "rgw_tenant_cloud_vault_namespace"),
     .prefix = cct->_conf.get_val<std::string>(
       "rgw_tenant_cloud_vault_prefix"),
-    .ssl_cacert = configured_or_kms("rgw_tenant_cloud_vault_ssl_cacert",
-                                    "rgw_crypt_vault_ssl_cacert"),
-    .ssl_clientcert = configured_or_kms("rgw_tenant_cloud_vault_ssl_clientcert",
-                                        "rgw_crypt_vault_ssl_clientcert"),
-    .ssl_clientkey = configured_or_kms("rgw_tenant_cloud_vault_ssl_clientkey",
-                                       "rgw_crypt_vault_ssl_clientkey"),
+    .ssl_cacert = cct->_conf.get_val<std::string>(
+      "rgw_tenant_cloud_vault_ssl_cacert"),
+    .ssl_clientcert = cct->_conf.get_val<std::string>(
+      "rgw_tenant_cloud_vault_ssl_clientcert"),
+    .ssl_clientkey = cct->_conf.get_val<std::string>(
+      "rgw_tenant_cloud_vault_ssl_clientkey"),
     .verify_ssl = cct->_conf.get_val<bool>(
       "rgw_tenant_cloud_vault_verify_ssl"),
   };
+  if (rgw::tenant_cloud::validate_vault_config(vault_config) < 0) {
+    return -EINVAL;
+  }
   const auto credential_cache_size = cct->_conf.get_val<uint64_t>(
     "rgw_tenant_cloud_credential_cache_size");
   const auto credential_cache_ttl = std::chrono::seconds{

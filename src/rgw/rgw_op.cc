@@ -1711,14 +1711,11 @@ void RGWPutBucketReplication::execute(optional_yield y) {
     ldpp_dout(this, 0) << "forward_request_to_master returned ret=" << op_ret << dendl;
     return;
   }
-  if (auto i = master_headers.find("X_RGW_TENANT_CLOUD_STATE");
-      i != master_headers.end()) {
-    if (i->second != "0" && i->second != "1") {
-      s->err.message = "metadata master returned invalid tenant-cloud state";
-      op_ret = -EIO;
-      return;
-    }
-    tenant_cloud_master_result = i->second == "1";
+  op_ret = rgw::tenant_cloud::decode_master_state(
+    master_headers, &tenant_cloud_master_result);
+  if (op_ret < 0) {
+    s->err.message = "metadata master returned invalid tenant-cloud state";
+    return;
   }
   // The metadata master owns tenant-cloud configuration.
   if (!s->penv.site->is_meta_master()) {
@@ -1841,14 +1838,11 @@ void RGWDeleteBucketReplication::execute(optional_yield y)
     ldpp_dout(this, 0) << "forward_request_to_master returned ret=" << op_ret << dendl;
     return;
   }
-  if (auto i = master_headers.find("X_RGW_TENANT_CLOUD_STATE");
-      i != master_headers.end()) {
-    if (i->second != "0" && i->second != "1") {
-      s->err.message = "metadata master returned invalid tenant-cloud state";
-      op_ret = -EIO;
-      return;
-    }
-    tenant_cloud_master_result = i->second == "1";
+  op_ret = rgw::tenant_cloud::decode_master_state(
+    master_headers, &tenant_cloud_master_result);
+  if (op_ret < 0) {
+    s->err.message = "metadata master returned invalid tenant-cloud state";
+    return;
   }
   if (!s->penv.site->is_meta_master()) {
     if (!tenant_cloud_master_result.has_value()) {
