@@ -2,6 +2,7 @@
 #include "rgw_vault_client.h"
 
 #include <sys/stat.h>
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 
@@ -164,6 +165,12 @@ int load_token(const std::string& path, std::string* token)
     --length;
   }
   if (length == 0) {
+    ::ceph::crypto::zeroize_for_security(buf, sizeof(buf));
+    return -EACCES;
+  }
+  if (std::any_of(buf, buf + length, [](unsigned char c) {
+        return c < 0x20 || c == 0x7f;
+      })) {
     ::ceph::crypto::zeroize_for_security(buf, sizeof(buf));
     return -EACCES;
   }

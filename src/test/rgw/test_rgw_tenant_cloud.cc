@@ -305,4 +305,20 @@ TEST(RGWVaultClient, ReturnsZeroForValidToken)
   EXPECT_EQ(0, std::remove(path));
 }
 
+TEST(RGWVaultClient, RejectsTokenWithEmbeddedControlCharacter)
+{
+  char path[] = "/tmp/rgw-vault-control-token-XXXXXX";
+  const int fd = mkstemp(path);
+  ASSERT_GE(fd, 0);
+  constexpr std::string_view contents = "token\nvalue";
+  ASSERT_EQ(static_cast<ssize_t>(contents.size()),
+            write(fd, contents.data(), contents.size()));
+  ASSERT_EQ(0, close(fd));
+
+  std::string token = "stale";
+  EXPECT_EQ(-EACCES, rgw::vault::testing::load_token(path, &token));
+  EXPECT_TRUE(token.empty());
+  EXPECT_EQ(0, std::remove(path));
+}
+
 } // anonymous namespace
