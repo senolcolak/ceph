@@ -79,6 +79,14 @@ TEST(RGWTenantCloud, validates_admission_syntax)
   EXPECT_EQ(-EINVAL, tc::validate(config, &error));
 
   config = valid_config();
+  config.region = "eu-central-1\r\nInjected";
+  EXPECT_EQ(-EINVAL, tc::validate(config, &error));
+
+  config = valid_config();
+  config.region = std::string(129, 'a');
+  EXPECT_EQ(-EINVAL, tc::validate(config, &error));
+
+  config = valid_config();
   config.target_bucket_arn = "arn:aws:s3:::backup/object";
   EXPECT_EQ(-EINVAL, tc::validate(config, &error));
 }
@@ -217,6 +225,8 @@ TEST(RGWTenantCloud, rejects_invalid_versioned_credentials)
          R"({"version":1,"access_key_id":"","secret_key":"secret"})",
          R"({"version":1,"access_key_id":"AKIA","secret_key":""})",
          R"({"version":1,"access_key_id":"AKIA","secret_key":"secret","session_token":""})",
+         R"({"version":1,"access_key_id":"AKIA\nInjected","secret_key":"secret"})",
+         R"({"version":1,"access_key_id":"AKIA","secret_key":"secret","session_token":"token\r\nInjected"})",
          R"({"version":1,"access_key_id":"AKIA"})",
          "not-json"}) {
     bufferlist encoded;
@@ -224,7 +234,15 @@ TEST(RGWTenantCloud, rejects_invalid_versioned_credentials)
     encoded.append(json);
     encoded.append("}}");
     tc::Credentials credentials;
+    credentials.version = 1;
+    credentials.access_key_id = "stale-access";
+    credentials.secret_key = "stale-secret";
+    credentials.session_token = "stale-token";
     EXPECT_EQ(-EINVAL, tc::parse_vault_credentials(encoded, &credentials));
+    EXPECT_EQ(0u, credentials.version);
+    EXPECT_TRUE(credentials.access_key_id.empty());
+    EXPECT_TRUE(credentials.secret_key.empty());
+    EXPECT_FALSE(credentials.session_token);
   }
 }
 

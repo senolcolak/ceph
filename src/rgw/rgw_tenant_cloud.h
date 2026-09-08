@@ -18,9 +18,6 @@ namespace rgw::tenant_cloud {
 inline constexpr auto config_attr = "user.rgw.tenant-cloud";
 inline constexpr auto epoch_attr = "user.rgw.tenant-cloud-epoch";
 
-// External destination data is deliberately kept out of rgw_sync_policy_info.
-// The policy points at an internal mirrored bucket; this attribute tells the
-// tenant-cloud data-sync module where that bucket is exported.
 struct Config {
   std::string rule_id;
   std::string endpoint;
@@ -87,12 +84,9 @@ struct Credentials {
   std::string secret_key;
   std::optional<std::string> session_token;
   std::optional<uint64_t> expires_at;
-  // Runtime-only freshness bound assigned by the credential cache.
   std::optional<uint64_t> cache_expires_at;
 };
 
-// These checks are admission checks only. Runtime DNS/IP policy is enforced
-// by the secure endpoint resolver and its connection socket filter.
 int validate(const Config& config, std::string* error);
 int validate_endpoint_policy(const CephContext* cct, const Config& config,
                              std::string* error);
@@ -100,8 +94,6 @@ int validate_endpoint_policy(const CephContext* cct, const Config& config,
 int decode_config(const Attrs& attrs, std::optional<Config>* config);
 void encode_config(const Config& config, Attrs* attrs);
 
-// Assign epoch + 1 on first creation and keep it stable for idempotent PUTs.
-// Online configuration changes are outside v1 and fail closed.
 int advance_generation(const std::optional<Config>& previous, uint64_t epoch,
                        Config* next);
 int decode_epoch(const Attrs& attrs, uint64_t* epoch);

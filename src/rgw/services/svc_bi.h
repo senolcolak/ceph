@@ -49,10 +49,6 @@ public:
   virtual int handle_sync_policy_update(const DoutPrefixProvider*,
                                         const RGWBucketInfo&,
                                         const RGWBucketInfo&,
-                                        // Explicitly supplied by the
-                                        // metadata writer; ordinary sync
-                                        // policy updates must not activate
-                                        // tenant-cloud backfill.
                                         bool tenant_cloud_activation,
                                         optional_yield) {
     return 0;

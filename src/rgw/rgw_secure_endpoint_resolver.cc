@@ -53,7 +53,10 @@ bool prohibited_v4(const boost::asio::ip::address_v4& address)
       in_range(value, 0xa9fe0000, 0xa9feffff) ||
       in_range(value, 0xc0000000, 0xc00000ff) ||
       in_range(value, 0xc0000200, 0xc00002ff) ||
+      in_range(value, 0xc01fc400, 0xc01fc4ff) ||
+      in_range(value, 0xc034c100, 0xc034c1ff) ||
       in_range(value, 0xc0586300, 0xc05863ff) ||
+      in_range(value, 0xc0af3000, 0xc0af30ff) ||
       in_range(value, 0xc6120000, 0xc613ffff) ||
       in_range(value, 0xc6336400, 0xc63364ff) ||
       in_range(value, 0xcb007100, 0xcb0071ff) ||

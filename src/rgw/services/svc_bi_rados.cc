@@ -1066,15 +1066,8 @@ int RGWSI_BucketIndex_RADOS::handle_sync_policy_update(
                         << dendl;
     return -EIO;
   }
-  // Data-log activation records are idempotent notifications. Repeat the
-  // notification for an already-enabled tenant-cloud policy so a metadata
-  // retry after a partial activation can recover shards whose records were
-  // not written before the original attempt failed.
   const auto& bilog = info.layout.logs.back();
   if (bilog.layout.type != rgw::BucketLogType::InIndex) {
-    // Tenant-cloud v1 has no activation marker for other layouts. Failing the
-    // metadata operation keeps the metadata-log entry retryable instead of
-    // reporting success without scheduling historical objects.
     return -EOPNOTSUPP;
   }
   const int shards_num = rgw::num_shards(bilog.layout.in_index);

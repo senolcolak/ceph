@@ -45,9 +45,6 @@ enum class RGWEndpointAddressPolicy {
 using RGWCurlOpenSocketCallback =
   curl_socket_t (*)(void*, curlsocktype, curl_sockaddr*);
 
-// Apply the socket-level protections used for tenant-controlled endpoints.
-// The callback argument is injectable so tests can prove that libcurl invokes
-// the callback configured on the actual easy handle.
 int rgw_apply_reject_prohibited_address_policy(
     CURL* easy_handle, RGWCurlOpenSocketCallback callback = nullptr);
 

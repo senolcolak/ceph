@@ -1720,16 +1720,9 @@ void RGWPutBucketReplication::execute(optional_yield y) {
     }
     tenant_cloud_master_result = i->second == "1";
   }
-  // Tenant-cloud configuration is authoritative on the metadata master. A
-  // forwarded request has already been committed there; applying it again in
-  // a lagging zone can derive a different generation or reject after the
-  // master committed. Normal metadata propagation updates this zone.
+  // The metadata master owns tenant-cloud configuration.
   if (!s->penv.site->is_meta_master()) {
     if (!tenant_cloud_master_result.has_value()) {
-      // Keep the established forwarding behavior for ordinary replication
-      // requests. A missing marker is fatal only when this operation is
-      // explicitly tenant-cloud related (or the local object still carries
-      // that state); otherwise an older master remains compatible.
       if (tenant_cloud_config ||
           s->bucket->get_attrs().contains(rgw::tenant_cloud::config_attr)) {
         s->err.message = "metadata master did not return tenant-cloud state";
@@ -1807,10 +1800,6 @@ void RGWPutBucketReplication::execute(optional_yield y) {
 
     s->bucket->get_info().set_sync_policy(std::move(sync_policy));
 
-    // A tenant-cloud PUT is also the explicit retry mechanism when the
-    // metadata write succeeded but activation scheduling previously failed.
-    // Online configuration changes are rejected by advance_generation(), so
-    // an enabled PUT is either first-enable or an identical retry.
     const bool tenant_cloud_activation =
       tenant_cloud_config && tenant_cloud_config->enabled;
     int ret = s->bucket->put_info_with_activation(

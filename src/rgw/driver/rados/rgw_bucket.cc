@@ -3044,12 +3044,7 @@ int RGWBucketInstanceMetadataHandler::put(std::string& entry, RGWMetadataObject*
   // write updated instance
   RGWBucketInfo* old_info = (old ? &old->info : nullptr);
   auto mtime = obj->get_mtime();
-  // Metadata replication must explicitly signal the first transition into
-  // tenant-cloud mode.  Ordinary rewrites of an already configured bucket
-  // must not reschedule every shard.
-  // A failed activation leaves the metadata-log entry incomplete.  Its replay
-  // carries the same object version, so retry that activation without treating
-  // an ordinary newer rewrite as a first enable.
+  // Retry activation only when replaying the same metadata version.
   std::optional<rgw::tenant_cloud::Config> tenant_cloud_config;
   if (bci.attrs.contains(rgw::tenant_cloud::config_attr)) {
     ret = rgw::tenant_cloud::decode_config(bci.attrs, &tenant_cloud_config);

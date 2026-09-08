@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <algorithm>
 #include <memory>
+#include <string_view>
 
 #include "common/ceph_json.h"
 #include "common/ceph_crypto.h"
@@ -43,6 +44,14 @@ std::string credential_cache_key(const rgw_owner& owner,
   const auto owner_string = to_string(owner);
   return std::to_string(owner_string.size()) + ":" + owner_string +
          credential_ref;
+}
+
+bool valid_header_value(std::string_view value)
+{
+  return !value.empty() &&
+    std::none_of(value.begin(), value.end(), [](unsigned char c) {
+      return c < 0x20 || c == 0x7f;
+    });
 }
 }
 
@@ -181,7 +190,10 @@ void CredentialCache::invalidate(const std::string& key)
 
 int parse_vault_credentials(bufferlist& response, Credentials* result)
 {
-  if (!result || response.length() == 0) return -EINVAL;
+  if (!result) return -EINVAL;
+  wipe(*result);
+  *result = Credentials{};
+  if (response.length() == 0) return -EINVAL;
   JSONParser parser;
   if (!parser.parse(response.c_str(), response.length())) return -EINVAL;
   JSONObj* outer = parser.find_obj("data");
@@ -193,19 +205,22 @@ int parse_vault_credentials(bufferlist& response, Credentials* result)
     if (!JSONDecoder::decode_json("version", parsed.version, data, true) ||
         !JSONDecoder::decode_json("access_key_id", parsed.access_key_id, data, true) ||
         !JSONDecoder::decode_json("secret_key", parsed.secret_key, data, true)) {
+      wipe(parsed);
       return -EINVAL;
     }
     JSONDecoder::decode_json("session_token", parsed.session_token, data);
     JSONDecoder::decode_json("expires_at", parsed.expires_at, data);
   } catch (const JSONDecoder::err&) {
+    wipe(parsed);
     return -EINVAL;
   }
-  if (parsed.version != 1 || parsed.access_key_id.empty() ||
+  if (parsed.version != 1 ||
+      !valid_header_value(parsed.access_key_id) ||
       parsed.secret_key.empty() ||
-      (parsed.session_token && parsed.session_token->empty())) {
+      (parsed.session_token && !valid_header_value(*parsed.session_token))) {
+    wipe(parsed);
     return -EINVAL;
   }
-  wipe(*result);
   *result = std::move(parsed);
   return 0;
 }
@@ -275,11 +290,7 @@ public:
         const auto cache_expiry = cache->put(
           cache_key, resolved, &cache_generation);
         if (!cache_expiry) {
-          // A missing expiry is normally valid when caching is disabled or
-          // the provider credential is too close to expiry. It is not valid
-          // when invalidation advanced this request's generation: publishing
-          // that result would let stale in-flight credentials escape the
-          // refresh fence.
+          // Reject credentials invalidated while this request was in flight.
           if (!cache->generation_is_current(cache_key, cache_generation)) {
             return set_cr_error(-ECANCELED);
           }

@@ -787,6 +787,26 @@ TEST(RGWTenantCloudSync, RejectsMixedPutPipeBeforeRemoteStat)
   EXPECT_EQ(0u, provider->resolve_count);
 }
 
+TEST(RGWTenantCloudSync, RejectsPutWithoutSyncEnvironment)
+{
+  auto provider = std::make_shared<FakeProvider>();
+  auto module = tc::make_data_sync_module(provider);
+  RGWDataSyncCtx sync;
+  sync.cct = g_ceph_context;
+  sync.source_zone = rgw_zone_id{"source-zone"};
+  auto pipe = sync_pipe();
+  rgw_obj_key key{"object"};
+  rgw_zone_set_entry source_trace;
+  auto* operation = module->sync_object(
+    nullptr, &sync, pipe, key, std::nullopt, source_trace, nullptr);
+  ASSERT_NE(nullptr, operation);
+
+  RGWCoroutinesManager manager(g_ceph_context, nullptr);
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(-EIO, manager.run(&dpp, operation));
+  EXPECT_EQ(0u, provider->resolve_count);
+}
+
 } // anonymous namespace
 
 #include <boost/asio/unyield.hpp>

@@ -28,10 +28,6 @@ struct SourceProperties {
   uint64_t pg_ver{0};
 };
 
-// HeaderPolicy and send_ready() retain the existing stream-writer void
-// contract. REST request preparation records signing failures and reports them
-// from send() before submitting the request.
-
 class Target {
 public:
   virtual ~Target() = default;
@@ -48,12 +44,8 @@ public:
                                       int* http_status = nullptr) = 0;
 };
 
-// Adapter for an existing REST connection. The shared ownership is retained by
-// every PUT/DELETE operation through completion.
 std::shared_ptr<Target> make_rest_target(std::shared_ptr<RGWRESTConn> conn);
 
-// Shared source-zone reader for plain and multipart S3 transfers. The source
-// connection remains owned by the data-sync context for the reader lifetime.
 class StreamGetCRF : public RGWStreamReadHTTPResourceCRF {
   RGWRESTConn* conn;
   rgw_obj src_obj;
@@ -78,8 +70,6 @@ int decode_rest_obj(const DoutPrefixProvider* dpp,
                     const std::map<std::string, std::string>& headers,
                     rgw_rest_obj* info);
 
-// Shared plain-object S3 writer. Target selection, endpoint validation,
-// credentials, object mapping and metadata policy remain adapter concerns.
 class StreamPutCRF : public RGWStreamWriteHTTPResourceCRF {
   std::shared_ptr<Target> target;
   rgw_obj dest_obj;

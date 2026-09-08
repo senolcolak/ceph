@@ -8,8 +8,7 @@
 
 class RGWGetDataCB;
 
-// Ephemeral credentials for an outbound S3 request. This is intentionally
-// separate from RGWAccessKey, which is a persisted/user-key representation.
+// Ephemeral outbound credentials with optional session token.
 struct RGWOutboundCredentials {
   std::string access_key_id;
   std::string secret_key;

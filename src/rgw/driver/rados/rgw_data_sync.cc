@@ -1680,10 +1680,6 @@ public:
           bs.bucket = source_bs.bucket;
           bs.shard_id = sid;
 	  pool = sync_env->svc->zone->get_zone_params().log_pool;
-          // The enclosing obligation remains in error_repo. Each generated
-          // bucket-shard retry belongs to the repository selected for that
-          // shard so normal retry consumers can find it under their own
-          // datalog shard.
           shard_error_repo =
             datalog_oid_for_error_repo(sc, sync_env->driver, pool, bs);
           tn->log(10, SSTR("writing shard_id " << sid << " of gen " << each->gen << " to error repo for retry"));
@@ -1706,8 +1702,6 @@ public:
         return ret;
       });
 
-      // Keep the outer full-sync retry marker when any shard retry record
-      // failed to persist. Removing it here would lose the obligation.
       if (retry_write_error < 0) {
         return set_cr_error(retry_write_error);
       }
@@ -1809,8 +1803,6 @@ public:
                                             timestamp));
         if (retcode < 0) {
           tn->log(0, SSTR("ERROR: failed to log " << source_bs.shard_id << " in error repo: retcode=" << retcode));
-          // Do not let marker_tracker->finish() overwrite this failure. The
-          // full-sync entry must be replayed until retry ownership is durable.
           return set_cr_error(retcode);
         }
         if (marker_tracker) {
@@ -1867,9 +1859,6 @@ public:
               });
       }
 
-      // A spawned shard may have failed before its retry ownership became
-      // durable. Do not advance the enclosing full-sync marker in that case;
-      // replaying the obligation is safe and preserves marker ownership.
       if (retcode < 0) {
         return set_cr_error(retcode);
       }
@@ -2028,9 +2017,6 @@ public:
 
       drain_all();
 
-      // A failed spawned entry has either persisted its retry ownership or
-      // returned an error. In the latter case, keep the full-sync marker at
-      // its current position so the entry is replayed.
       if (retcode < 0) {
         return set_cr_error(retcode);
       }

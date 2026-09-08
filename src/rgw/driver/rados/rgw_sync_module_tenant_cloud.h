@@ -44,11 +44,6 @@ class TargetContextProvider {
 public:
   virtual ~TargetContextProvider() = default;
 
-  // Inputs are values so that implementations can safely move them into a
-  // resolver coroutine. Implementations must copy any dependency needed across
-  // a yield, must publish the result exactly once and only on success, and must
-  // not retain result or dpp after the returned coroutine completes. The
-  // provider is trusted to construct target from the identity stored beside it.
   virtual RGWCoroutine* resolve(const DoutPrefixProvider* dpp,
                                 RGWDataSyncCtx* sync, rgw_owner owner,
                                 std::string bucket_instance_id, Config config,
@@ -89,7 +84,6 @@ std::unique_ptr<RGWDataSyncModule> make_data_sync_module(
 
 } // namespace rgw::tenant_cloud
 
-// Tenant-cloud data-sync module registration.
 class RGWTenantCloudSyncModule : public RGWSyncModule {
 public:
   bool supports_data_export() override

@@ -1522,8 +1522,6 @@ struct ReplicationConfiguration {
         }
         *tenant_cloud_config = std::move(config);
 
-        // RGWSyncBucketCR requires a real Ceph bucket on both sides. The
-        // external ARN is retained only in the versioned bucket attribute.
         pipe->dest.bucket = s->bucket->get_info().bucket;
       } else {
         pipe->dest.bucket.emplace(dest_bk);

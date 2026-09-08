@@ -26,6 +26,14 @@ bool valid_credential_name(std::string_view name)
   });
 }
 
+bool valid_signing_region(std::string_view region)
+{
+  return !region.empty() && region.size() <= 128 &&
+    std::all_of(region.begin(), region.end(), [](unsigned char c) {
+      return std::isalnum(c) || c == '-';
+    });
+}
+
 } // anonymous namespace
 
 int validate(const Config& config, std::string* error)
@@ -53,8 +61,8 @@ int validate(const Config& config, std::string* error)
   if (config.source_zone_id.empty()) {
     return fail("external replication requires one source zone");
   }
-  if (config.region.empty()) {
-    return fail("external replication requires a destination signing region");
+  if (!valid_signing_region(config.region)) {
+    return fail("external replication requires a valid destination signing region");
   }
   if (config.host_style != "path") {
     return fail("tenant-cloud replication supports path HostStyle only");

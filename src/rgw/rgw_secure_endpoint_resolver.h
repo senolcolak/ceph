@@ -10,13 +10,8 @@
 
 namespace rgw::secure_endpoint {
 
-// Validate the syntax accepted by the initial tenant-cloud path-style client.
-// This is an admission check only; DNS answers must be checked again at
-// connection time by the strict connection resolver.
 int validate_https_endpoint(std::string_view endpoint);
 
-// Match the endpoint host against a comma-separated operator allowlist of
-// exact DNS names or IP literals. An empty list denies all endpoints.
 bool is_endpoint_host_allowed(std::string_view endpoint,
                               std::string_view allowlist);
 

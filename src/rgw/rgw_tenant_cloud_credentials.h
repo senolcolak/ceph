@@ -11,7 +11,6 @@
 
 namespace rgw::tenant_cloud {
 
-// Parse the versioned credential object from a Vault KV-v2 response.
 int parse_vault_credentials(bufferlist& response, Credentials* result);
 
 class CredentialResolver {

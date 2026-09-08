@@ -218,9 +218,6 @@ class RGWTenantCloudResolvedProvider final
 
     ~ResolveCR() override
     {
-      // A coroutine can be destroyed while waiting on Vault. Leaders
-      // must publish a terminal result so that waiters never remain attached
-      // to an abandoned in-flight resolution.
       if (leader && inflight) {
         parent->finish_resolution(cache_key, inflight, -ECANCELED, {});
       }
@@ -232,9 +229,6 @@ class RGWTenantCloudResolvedProvider final
         if (!resolver || !result) {
           return set_cr_error(-EINVAL);
         }
-        // The operator allowlist is runtime-configurable. Recheck it even on
-        // a cache hit so a removed destination cannot keep using a stale
-        // target context until its TTL expires.
         if (rgw::tenant_cloud::validate_endpoint_policy(
               sync->cct, config, nullptr) < 0) {
           return set_cr_error(-EINVAL);
@@ -326,8 +320,6 @@ public:
       << "ERROR: tenant-cloud replication does not support "
       << operation << dendl;
 
-    // EIO is not one of RGWBucketSyncSingleEntryCR's ignored outcomes. This
-    // keeps retry ownership in Ceph and prevents marker advancement.
     return set_cr_error(-EIO);
   }
 };
@@ -380,7 +372,9 @@ public:
   int operate(const DoutPrefixProvider* dpp) override
   {
     reenter(this) {
-      if (!sync || !sync->env || config_result < 0 || !config ||
+      if (!sync || !sync->env ||
+          (sync->env->async_rados && !sync->env->driver) ||
+          config_result < 0 || !config ||
           !pipe_matches || !provider ||
           sync->source_zone.id != config->source_zone_id ||
           key.need_to_encode_instance() ||
@@ -388,10 +382,7 @@ public:
         return set_cr_error(-EIO);
       }
 
-      // A delete event can be retried after a newer PUT has already appeared.
-      // Recheck source state before deleting the destination; the normal data
-      // sync ordering handles the remaining event when the object exists.
-      // Unit tests with no RADOS service use the injected target directly.
+      // Avoid applying a stale DELETE after a newer PUT.
       if (sync->env->async_rados) {
         yield call(new RGWStatRemoteObjCR(
           sync->env->async_rados, sync->env->driver, sync->source_zone,
@@ -591,7 +582,9 @@ public:
   int operate(const DoutPrefixProvider*) override
   {
     reenter(this) {
-      if (config_result < 0 || !config || !config->enabled || !provider ||
+      if (!sync || !sync->env || !sync->env->svc ||
+          !sync->env->svc->zone || config_result < 0 || !config ||
+          !config->enabled || !provider ||
           !pipe_matches_source(sync_pipe) ||
           sync->source_zone.id != config->source_zone_id ||
           key.need_to_encode_instance() ||
@@ -775,8 +768,6 @@ int make_delete_path(const TargetContext& context, const rgw_obj_key& key,
       !key.ns.empty()) {
     return -EINVAL;
   }
-  // RGWRESTStreamRWRequest::send_prepare() performs the canonical URL encoding.
-  // Passing pre-encoded data here would encode '%' a second time.
   *path = context.destination_bucket + "/" + key.name;
   return 0;
 }
