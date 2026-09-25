@@ -48,6 +48,18 @@ TEST(RGWTenantCloudSync, RejectsInvalidVaultConfigurationAtStartup)
                                 old_token_file);
 }
 
+TEST(RGWTenantCloudSync, RejectsIgnoredZoneTierConfiguration)
+{
+  RGWTenantCloudSyncModule module;
+  JSONFormattable config;
+  ASSERT_EQ(0, config.set("vault_addr", "https://vault.example.test"));
+  RGWSyncModuleInstanceRef instance;
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(-EINVAL, module.create_instance(
+    &dpp, g_ceph_context, config, &instance));
+  EXPECT_FALSE(instance);
+}
+
 class DoneCR final : public RGWCoroutine {
   int result;
 public:
@@ -88,6 +100,38 @@ TEST(RGWDataSync, FinishesMarkerAfterRetryOwnershipIsDurable)
   NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
   EXPECT_EQ(0, manager.run(&dpp, operation));
   EXPECT_TRUE(marker_finished);
+}
+
+TEST(RGWDataSync, PropagatesMarkerFailureAfterRetryOwnershipIsDurable)
+{
+  bool marker_finished = false;
+  auto finish_marker = [&marker_finished]() -> RGWCoroutine* {
+    marker_finished = true;
+    return new DoneCR(g_ceph_context, -EIO);
+  };
+  auto* operation = rgw::data_sync::persist_retry_before_marker(
+    g_ceph_context, new DoneCR(g_ceph_context), finish_marker);
+
+  RGWCoroutinesManager manager(g_ceph_context, nullptr);
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(-EIO, manager.run(&dpp, operation));
+  EXPECT_TRUE(marker_finished);
+}
+
+TEST(RGWDataSync, RejectsMissingRetryWrite)
+{
+  bool marker_finished = false;
+  auto finish_marker = [&marker_finished]() -> RGWCoroutine* {
+    marker_finished = true;
+    return new DoneCR(g_ceph_context);
+  };
+  auto* operation = rgw::data_sync::persist_retry_before_marker(
+    g_ceph_context, nullptr, finish_marker);
+
+  RGWCoroutinesManager manager(g_ceph_context, nullptr);
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(-EINVAL, manager.run(&dpp, operation));
+  EXPECT_FALSE(marker_finished);
 }
 
 class DelayedErrorCR final : public RGWCoroutine {
@@ -205,7 +249,8 @@ public:
   unsigned resolve_count{0};
   unsigned invalidate_count{0};
 
-  RGWCoroutine* resolve(rgw_owner, tc::Config, tc::Credentials*) override
+  RGWCoroutine* resolve(RGWHTTPManager*, rgw_owner, tc::Config,
+                        tc::Credentials*) override
   {
     ++resolve_count;
     return new DelayedErrorCR(g_ceph_context, -EIO);
@@ -543,6 +588,45 @@ TEST(RGWTenantCloudSync, RunsInjectedProviderDeleteCoroutine)
   EXPECT_EQ(0, manager.run(&dpp, operation));
   EXPECT_EQ(1u, provider->resolve_count);
   EXPECT_TRUE(provider->target->delete_called);
+}
+
+TEST(RGWTenantCloudSync, FailsClosedForVersionedDelete)
+{
+  auto provider = std::make_shared<FakeProvider>();
+  auto module = tc::make_data_sync_module(provider);
+  RGWDataSyncCtx sync;
+  sync.cct = g_ceph_context;
+  auto pipe = sync_pipe();
+  rgw_obj_key key{"object", "version-id"};
+  real_time mtime;
+  auto* operation = module->remove_object(nullptr, &sync, pipe, key, mtime,
+                                          true, 0, nullptr);
+  ASSERT_NE(nullptr, operation);
+  RGWCoroutinesManager manager(g_ceph_context, nullptr);
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(-EIO, manager.run(&dpp, operation));
+  EXPECT_EQ(0u, provider->resolve_count);
+  EXPECT_FALSE(provider->target->delete_called);
+}
+
+TEST(RGWTenantCloudSync, FailsClosedForDeleteMarker)
+{
+  auto provider = std::make_shared<FakeProvider>();
+  auto module = tc::make_data_sync_module(provider);
+  RGWDataSyncCtx sync;
+  sync.cct = g_ceph_context;
+  auto pipe = sync_pipe();
+  rgw_obj_key key{"object", "version-id"};
+  real_time mtime;
+  rgw_bucket_entry_owner owner;
+  NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
+  auto* operation = module->create_delete_marker(
+    &dpp, &sync, pipe, key, mtime, owner, false, 0, nullptr);
+  ASSERT_NE(nullptr, operation);
+  RGWCoroutinesManager manager(g_ceph_context, nullptr);
+  EXPECT_EQ(-EIO, manager.run(&dpp, operation));
+  EXPECT_EQ(0u, provider->resolve_count);
+  EXPECT_FALSE(provider->target->delete_called);
 }
 
 TEST(RGWTenantCloudSync, RejectsDeleteWithoutSyncEnvironment)

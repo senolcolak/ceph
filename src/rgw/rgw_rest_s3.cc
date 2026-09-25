@@ -1454,7 +1454,7 @@ struct ReplicationConfiguration {
         }
         if (!source || source->zone_names.size() != 1) {
           s->err.message =
-            "The tenant-cloud PoC requires exactly one source Zone";
+            "External replication requires exactly one source Zone";
           return -ERR_NOT_IMPLEMENTED;
         }
         std::unique_ptr<rgw::sal::Zone> source_zone;
@@ -1470,20 +1470,20 @@ struct ReplicationConfiguration {
         }
         if (s->bucket->get_info().versioned()) {
           s->err.message =
-            "The tenant-cloud PoC does not safely replicate versioned buckets";
+            "External replication does not support versioned buckets";
           return -ERR_NOT_IMPLEMENTED;
         }
         if (filter && (filter->tag ||
                        (filter->and_elements &&
                         !filter->and_elements->tags.empty()))) {
           s->err.message =
-            "The tenant-cloud PoC supports prefix filters only";
+            "External replication supports prefix filters only";
           return -ERR_NOT_IMPLEMENTED;
         }
         if (delete_marker_replication &&
             delete_marker_replication->status == "Enabled") {
           s->err.message =
-            "The tenant-cloud PoC does not support delete-marker replication";
+            "External replication does not support delete-marker replication";
           return -ERR_NOT_IMPLEMENTED;
         }
         if (destination.account || destination.acl_translation) {

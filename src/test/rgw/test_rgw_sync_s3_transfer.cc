@@ -233,9 +233,14 @@ TEST(RGWSyncS3Transfer, RejectsMissingSourceObjectSize)
     {"CONTENT_TYPE", "application/octet-stream"},
   };
   rgw_rest_obj object;
+  object.content_len = 17;
+  object.attrs.emplace("existing", "value");
   NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
 
   EXPECT_EQ(-EIO, s3::decode_rest_obj(&dpp, attrs, headers, &object));
+  EXPECT_EQ(17u, object.content_len);
+  EXPECT_EQ(1u, object.attrs.size());
+  EXPECT_EQ("value", object.attrs.at("existing"));
 }
 
 TEST(RGWSyncS3Transfer, RejectsInvalidSourceObjectSize)
@@ -267,9 +272,14 @@ TEST(RGWSyncS3Transfer, RejectsCorruptSourceAcl)
     {"RGWX_OBJECT_SIZE", "0"},
   };
   rgw_rest_obj object;
+  object.content_len = 17;
+  object.attrs.emplace("existing", "value");
   NoDoutPrefix dpp{g_ceph_context, ceph_subsys_rgw};
 
   EXPECT_EQ(-EIO, s3::decode_rest_obj(&dpp, attrs, headers, &object));
+  EXPECT_EQ(17u, object.content_len);
+  EXPECT_EQ(1u, object.attrs.size());
+  EXPECT_EQ("value", object.attrs.at("existing"));
 }
 
 } // anonymous namespace

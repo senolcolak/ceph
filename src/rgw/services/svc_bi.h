@@ -48,9 +48,13 @@ public:
                                optional_yield y) = 0;
   virtual int handle_sync_policy_update(const DoutPrefixProvider*,
                                         const RGWBucketInfo&,
-                                        const RGWBucketInfo&,
                                         bool tenant_cloud_activation,
                                         optional_yield) {
+    return 0;
+  }
+  virtual int validate_sync_policy_update(const DoutPrefixProvider*,
+                                          const RGWBucketInfo&,
+                                          bool tenant_cloud_activation) {
     return 0;
   }
 };

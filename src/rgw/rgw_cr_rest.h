@@ -13,7 +13,7 @@
 
 struct rgw_rest_obj {
   rgw_obj_key key;
-  uint64_t content_len;
+  uint64_t content_len{0};
   std::map<std::string, std::string> attrs;
   std::map<std::string, std::string> custom_attrs;
   RGWAccessControlPolicy acls;

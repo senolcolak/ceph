@@ -167,9 +167,11 @@ public:
 
   int handle_sync_policy_update(const DoutPrefixProvider*,
                                 const RGWBucketInfo&,
-                                const RGWBucketInfo&,
                                 bool tenant_cloud_activation,
                                 optional_yield) override;
+  int validate_sync_policy_update(const DoutPrefixProvider*,
+                                  const RGWBucketInfo&,
+                                  bool tenant_cloud_activation) override;
 
   int open_bucket_index_shard(const DoutPrefixProvider *dpp,
                               const RGWBucketInfo& bucket_info,

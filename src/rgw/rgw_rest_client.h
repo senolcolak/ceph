@@ -15,6 +15,11 @@ struct RGWOutboundCredentials {
   std::optional<std::string> session_token;
 
   RGWOutboundCredentials() = default;
+  RGWOutboundCredentials(const RGWOutboundCredentials&);
+  RGWOutboundCredentials& operator=(const RGWOutboundCredentials&);
+  RGWOutboundCredentials(RGWOutboundCredentials&&) noexcept;
+  RGWOutboundCredentials& operator=(RGWOutboundCredentials&&) noexcept;
+  ~RGWOutboundCredentials();
   RGWOutboundCredentials(std::string id, std::string secret,
                          std::optional<std::string> token = std::nullopt)
     : access_key_id(std::move(id)), secret_key(std::move(secret)),

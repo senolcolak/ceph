@@ -141,6 +141,7 @@ add_executable(unittest_rgw_secure_endpoint_resolver
 add_ceph_unittest(unittest_rgw_secure_endpoint_resolver)
 target_link_libraries(unittest_rgw_secure_endpoint_resolver rgw_common ${rgw_libs})
 
+if(WITH_RADOSGW_RADOS)
 # unittest_rgw_tenant_cloud
 add_executable(unittest_rgw_tenant_cloud
   test_rgw_tenant_cloud.cc
@@ -148,7 +149,6 @@ add_executable(unittest_rgw_tenant_cloud
 add_ceph_unittest(unittest_rgw_tenant_cloud)
 target_link_libraries(unittest_rgw_tenant_cloud rgw_common ${rgw_libs})
 
-if(WITH_RADOSGW_RADOS)
 # unittest_rgw_sync_s3_transfer
 add_executable(unittest_rgw_sync_s3_transfer
   test_rgw_sync_s3_transfer.cc

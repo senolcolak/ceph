@@ -22,6 +22,7 @@ struct RGWVaultConfig {
   std::string ssl_clientcert;
   std::string ssl_clientkey;
   bool verify_ssl{true};
+  bool reject_prohibited_addresses{false};
 };
 
 namespace rgw::vault::testing {
@@ -42,7 +43,8 @@ public:
               std::string_view path, const std::string& postdata,
               optional_yield y, bufferlist& response) const;
 #ifdef WITH_RADOSGW_RADOS
-  RGWCoroutine* request_async(const char* method, std::string_view path,
+  RGWCoroutine* request_async(RGWHTTPManager* http_manager,
+                              const char* method, std::string_view path,
                               std::string postdata,
                               bufferlist* response) const;
 #endif

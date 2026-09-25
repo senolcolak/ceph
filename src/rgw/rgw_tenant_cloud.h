@@ -17,6 +17,8 @@ namespace rgw::tenant_cloud {
 
 inline constexpr auto config_attr = "user.rgw.tenant-cloud";
 inline constexpr auto epoch_attr = "user.rgw.tenant-cloud-epoch";
+inline constexpr auto activation_attr =
+  "user.rgw.tenant-cloud-active-generation";
 
 struct Config {
   std::string rule_id;
@@ -85,6 +87,13 @@ struct Credentials {
   std::optional<std::string> session_token;
   std::optional<uint64_t> expires_at;
   std::optional<uint64_t> cache_expires_at;
+
+  Credentials() = default;
+  Credentials(const Credentials&);
+  Credentials& operator=(const Credentials&);
+  Credentials(Credentials&&) noexcept;
+  Credentials& operator=(Credentials&&) noexcept;
+  ~Credentials();
 };
 
 int validate(const Config& config, std::string* error);
@@ -100,5 +109,7 @@ int advance_generation(const std::optional<Config>& previous, uint64_t epoch,
                        Config* next);
 int decode_epoch(const Attrs& attrs, uint64_t* epoch);
 void encode_epoch(uint64_t epoch, Attrs* attrs);
+bool activation_required(const Attrs& attrs, const Config& config);
+void encode_activation(uint64_t generation, Attrs* attrs);
 
 } // namespace rgw::tenant_cloud

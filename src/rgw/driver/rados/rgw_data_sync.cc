@@ -1859,9 +1859,6 @@ public:
               });
       }
 
-      if (retcode < 0) {
-        return set_cr_error(retcode);
-      }
       if (marker_tracker) {
         yield call(marker_tracker->finish(key));
         if (retcode < 0) {
@@ -2016,10 +2013,6 @@ public:
       omapvals.reset();
 
       drain_all();
-
-      if (retcode < 0) {
-        return set_cr_error(retcode);
-      }
 
       tn->unset_flag(RGW_SNS_FLAG_ACTIVE);
 

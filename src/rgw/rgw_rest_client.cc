@@ -8,6 +8,7 @@
 #include "rgw_http_errors.h"
 
 #include "common/strtol.h"
+#include "common/ceph_crypto.h"
 #include "include/str_list.h"
 #include "rgw_crypt_sanitize.h"
 
@@ -15,6 +16,72 @@
 #define dout_subsys ceph_subsys_rgw
 
 using namespace std;
+
+namespace {
+
+void wipe_credentials(RGWOutboundCredentials& credentials)
+{
+  if (!credentials.access_key_id.empty()) {
+    ceph::crypto::zeroize_for_security(credentials.access_key_id.data(),
+                                       credentials.access_key_id.size());
+  }
+  if (!credentials.secret_key.empty()) {
+    ceph::crypto::zeroize_for_security(credentials.secret_key.data(),
+                                       credentials.secret_key.size());
+  }
+  if (credentials.session_token && !credentials.session_token->empty()) {
+    ceph::crypto::zeroize_for_security(credentials.session_token->data(),
+                                       credentials.session_token->size());
+  }
+}
+
+} // anonymous namespace
+
+RGWOutboundCredentials::RGWOutboundCredentials(
+  const RGWOutboundCredentials& other)
+  : access_key_id(other.access_key_id), secret_key(other.secret_key),
+    session_token(other.session_token)
+{
+}
+
+RGWOutboundCredentials& RGWOutboundCredentials::operator=(
+  const RGWOutboundCredentials& other)
+{
+  if (this != &other) {
+    wipe_credentials(*this);
+    access_key_id = other.access_key_id;
+    secret_key = other.secret_key;
+    session_token = other.session_token;
+  }
+  return *this;
+}
+
+RGWOutboundCredentials::RGWOutboundCredentials(
+  RGWOutboundCredentials&& other) noexcept
+  : access_key_id(std::move(other.access_key_id)),
+    secret_key(std::move(other.secret_key)),
+    session_token(std::move(other.session_token))
+{
+  wipe_credentials(other);
+}
+
+RGWOutboundCredentials& RGWOutboundCredentials::operator=(
+  RGWOutboundCredentials&& other) noexcept
+{
+  if (this != &other) {
+    wipe_credentials(*this);
+    access_key_id = std::move(other.access_key_id);
+    secret_key = std::move(other.secret_key);
+    session_token = std::move(other.session_token);
+    wipe_credentials(other);
+  }
+  return *this;
+}
+
+RGWOutboundCredentials::~RGWOutboundCredentials()
+{
+  wipe_credentials(*this);
+}
 
 int RGWHTTPSimpleRequest::get_status()
 {

@@ -57,6 +57,11 @@ void RGWRESTConn::resolve_endpoints() {
       res_ep.port = (scheme == "https" ? 443 : 80);
     }
 
+    if (endpoint_selection_policy ==
+        RGWEndpointSelectionPolicy::defer_to_curl) {
+      continue;
+    }
+
     // resolve all IP addresses for the host
     boost::asio::io_context io_ctx;
     boost::asio::ip::tcp::resolver resolver(io_ctx);
@@ -163,7 +168,6 @@ RGWRESTConn::RGWRESTConn(CephContext *_cct,
                          RGWEndpointSelectionPolicy _endpoint_policy,
                          RGWEndpointAddressPolicy _address_policy)
   : cct(_cct),
-    key(_cred.access_key_id, _cred.secret_key),
     credentials(std::move(_cred)),
     self_zone_group(std::move(_zone_group)),
     remote_id(_remote_id),
@@ -226,8 +230,11 @@ ResolvedEndpoint* RGWRESTConn::find_resolved_endpoint(const std::string& url)
 
 void RGWRESTConn::populate_connect_to(RGWEndpoint& endpoint, ResolvedEndpoint& resolved_endpoint)
 {
-  if (!cct->_conf->rgw_rest_conn_connect_to_resolved_ips &&
-      endpoint_selection_policy == RGWEndpointSelectionPolicy::allow_fallback) {
+  if (endpoint_selection_policy ==
+        RGWEndpointSelectionPolicy::defer_to_curl ||
+      (!cct->_conf->rgw_rest_conn_connect_to_resolved_ips &&
+       endpoint_selection_policy ==
+         RGWEndpointSelectionPolicy::allow_fallback)) {
     return;
   }
 
@@ -269,8 +276,8 @@ void RGWRESTConn::populate_connect_to(RGWEndpoint& endpoint, ResolvedEndpoint& r
 int RGWRESTConn::get_endpoint(RGWEndpoint& endpoint)
 {
   endpoint.set_address_policy(endpoint_address_policy);
-  const bool allow_fallback =
-    endpoint_selection_policy == RGWEndpointSelectionPolicy::allow_fallback;
+  const bool allow_fallback = endpoint_selection_policy !=
+    RGWEndpointSelectionPolicy::require_pinned;
   // A reused endpoint may carry a pin from a previous selection. Clear it
   // before selecting a new URL so fallback cannot retain a stale mapping.
   endpoint.set_connect_to("");

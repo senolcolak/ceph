@@ -11,6 +11,7 @@
 
 #include "rgw_arn.h"
 #include "rgw_secure_endpoint_resolver.h"
+#include "common/ceph_crypto.h"
 #include "common/ceph_context.h"
 
 namespace rgw::tenant_cloud {
@@ -34,7 +35,73 @@ bool valid_signing_region(std::string_view region)
     });
 }
 
+void wipe_credentials(Credentials& credentials)
+{
+  if (!credentials.access_key_id.empty()) {
+    ceph::crypto::zeroize_for_security(credentials.access_key_id.data(),
+                                       credentials.access_key_id.size());
+  }
+  if (!credentials.secret_key.empty()) {
+    ceph::crypto::zeroize_for_security(credentials.secret_key.data(),
+                                       credentials.secret_key.size());
+  }
+  if (credentials.session_token && !credentials.session_token->empty()) {
+    ceph::crypto::zeroize_for_security(credentials.session_token->data(),
+                                       credentials.session_token->size());
+  }
+}
+
 } // anonymous namespace
+
+Credentials::Credentials(const Credentials& other)
+  : version(other.version), access_key_id(other.access_key_id),
+    secret_key(other.secret_key), session_token(other.session_token),
+    expires_at(other.expires_at), cache_expires_at(other.cache_expires_at)
+{
+}
+
+Credentials& Credentials::operator=(const Credentials& other)
+{
+  if (this != &other) {
+    wipe_credentials(*this);
+    version = other.version;
+    access_key_id = other.access_key_id;
+    secret_key = other.secret_key;
+    session_token = other.session_token;
+    expires_at = other.expires_at;
+    cache_expires_at = other.cache_expires_at;
+  }
+  return *this;
+}
+
+Credentials::Credentials(Credentials&& other) noexcept
+  : version(other.version), access_key_id(std::move(other.access_key_id)),
+    secret_key(std::move(other.secret_key)),
+    session_token(std::move(other.session_token)),
+    expires_at(other.expires_at), cache_expires_at(other.cache_expires_at)
+{
+  wipe_credentials(other);
+}
+
+Credentials& Credentials::operator=(Credentials&& other) noexcept
+{
+  if (this != &other) {
+    wipe_credentials(*this);
+    version = other.version;
+    access_key_id = std::move(other.access_key_id);
+    secret_key = std::move(other.secret_key);
+    session_token = std::move(other.session_token);
+    expires_at = other.expires_at;
+    cache_expires_at = other.cache_expires_at;
+    wipe_credentials(other);
+  }
+  return *this;
+}
+
+Credentials::~Credentials()
+{
+  wipe_credentials(*this);
+}
 
 int validate(const Config& config, std::string* error)
 {
@@ -119,7 +186,7 @@ int decode_config(const Attrs& attrs, std::optional<Config>* config)
     Config decoded;
     decode(decoded, p);
     if (decoded.config_generation == 0) {
-      return -EIO;
+      return 0;
     }
     *config = std::move(decoded);
   } catch (const buffer::error&) {
@@ -159,6 +226,38 @@ void encode_epoch(uint64_t epoch, Attrs* attrs)
   encoded_epoch = epoch;
   ceph::encode_raw(encoded_epoch, bl);
   (*attrs)[epoch_attr] = std::move(bl);
+}
+
+bool activation_required(const Attrs& attrs, const Config& config)
+{
+  if (!config.enabled) {
+    return false;
+  }
+  const auto i = attrs.find(activation_attr);
+  if (i == attrs.end()) {
+    return true;
+  }
+  try {
+    auto p = i->second.cbegin();
+    ceph_le64 encoded_generation;
+    ceph::decode_raw(encoded_generation, p);
+    return static_cast<uint64_t>(encoded_generation) !=
+      config.config_generation;
+  } catch (const buffer::error&) {
+    return true;
+  }
+}
+
+void encode_activation(uint64_t generation, Attrs* attrs)
+{
+  if (!attrs) {
+    return;
+  }
+  bufferlist bl;
+  ceph_le64 encoded_generation;
+  encoded_generation = generation;
+  ceph::encode_raw(encoded_generation, bl);
+  (*attrs)[activation_attr] = std::move(bl);
 }
 
 void encode_config(const Config& config, Attrs* attrs)
@@ -203,10 +302,20 @@ int advance_generation(const std::optional<Config>& previous, uint64_t epoch,
   expected.config_generation = 0;
   auto requested = *next;
   requested.config_generation = 0;
+  const bool enabled_changed = expected.enabled != requested.enabled;
+  expected.enabled = requested.enabled;
   if (expected != requested) {
     return -EOPNOTSUPP;
   }
-  next->config_generation = previous->config_generation;
+  if (!enabled_changed) {
+    next->config_generation = previous->config_generation;
+    return 0;
+  }
+  const uint64_t current = std::max(epoch, previous->config_generation);
+  if (current == std::numeric_limits<uint64_t>::max()) {
+    return -EOVERFLOW;
+  }
+  next->config_generation = current + 1;
   return 0;
 }
 

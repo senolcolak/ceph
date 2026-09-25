@@ -77,8 +77,27 @@ TEST(RGWRESTConn, outbound_credentials_are_retained)
   EXPECT_EQ(credentials.secret_key, conn.get_credentials().secret_key);
   ASSERT_TRUE(conn.get_credentials().session_token);
   EXPECT_EQ("temporary-session", *conn.get_credentials().session_token);
-  EXPECT_EQ(credentials.access_key_id, conn.get_key().id);
-  EXPECT_EQ(credentials.secret_key, conn.get_key().key);
+  EXPECT_TRUE(conn.get_key().id.empty());
+  EXPECT_TRUE(conn.get_key().key.empty());
+}
+
+TEST(RGWRESTConn, deferred_resolution_uses_curl_address_policy)
+{
+  constexpr auto endpoint_url = "https://deferred.example.invalid";
+  RGWRESTConn conn(
+    g_ceph_context, "remote-zone", {endpoint_url},
+    RGWOutboundCredentials("access", "secret"), "zonegroup",
+    std::nullopt, PathStyle, RGWEndpointSelectionPolicy::defer_to_curl,
+    RGWEndpointAddressPolicy::reject_prohibited);
+  ASSERT_EQ(1u, conn.get_endpoint_count());
+  EXPECT_TRUE(conn.get_resolved_endpoints().front().resolved_ips.empty());
+
+  RGWEndpoint endpoint;
+  EXPECT_EQ(0, conn.get_endpoint(endpoint));
+  EXPECT_EQ(endpoint_url, endpoint.get_url());
+  EXPECT_TRUE(endpoint.get_connect_to().empty());
+  EXPECT_EQ(RGWEndpointAddressPolicy::reject_prohibited,
+            endpoint.get_address_policy());
 }
 
 TEST(RGWRESTConn, temporary_credentials_fail_before_sigv2_send)

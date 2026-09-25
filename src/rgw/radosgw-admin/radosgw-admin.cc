@@ -91,6 +91,7 @@ extern "C" {
 #include "rgw_data_access.h"
 #include "rgw_account.h"
 #include "rgw_bucket_logging.h"
+#include "rgw_tenant_cloud.h"
 #include "rgw_dedup_cluster.h"
 #include "rgw_dedup_filter.h"
 #include "services/svc_sync_modules.h"
@@ -3639,6 +3640,12 @@ public:
         return -ret;
       }
       return 0;
+    }
+    if (bucket->get_attrs().contains(rgw::tenant_cloud::config_attr)) {
+      cerr << "refusing to replace the sync policy while tenant-cloud"
+              " replication is configured; remove the bucket replication"
+              " configuration first" << std::endl;
+      return -EBUSY;
     }
 
     int ret = bucket->put_info(dpp(), false, real_time(), null_yield);

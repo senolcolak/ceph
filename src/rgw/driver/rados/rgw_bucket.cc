@@ -3044,21 +3044,43 @@ int RGWBucketInstanceMetadataHandler::put(std::string& entry, RGWMetadataObject*
   // write updated instance
   RGWBucketInfo* old_info = (old ? &old->info : nullptr);
   auto mtime = obj->get_mtime();
-  // Retry activation only when replaying the same metadata version.
   std::optional<rgw::tenant_cloud::Config> tenant_cloud_config;
   if (bci.attrs.contains(rgw::tenant_cloud::config_attr)) {
     ret = rgw::tenant_cloud::decode_config(bci.attrs, &tenant_cloud_config);
     if (ret < 0) {
-      return ret;
+      ldpp_dout(dpp, -1) << "ERROR: quarantining invalid tenant-cloud"
+                          << " configuration for bucket instance " << entry
+                          << "; unrelated metadata updates will continue"
+                          << dendl;
+    }
+    if (ret < 0 || !tenant_cloud_config) {
+      bci.attrs.erase(rgw::tenant_cloud::config_attr);
+      bci.attrs.erase(rgw::tenant_cloud::activation_attr);
+      tenant_cloud_config.reset();
     }
   }
-  const bool same_metadata_version =
-    old && old->info.objv_tracker.write_version ==
-      bci.info.objv_tracker.write_version;
-  const bool tenant_cloud_activation =
-    tenant_cloud_config && tenant_cloud_config->enabled &&
-    (!old || !old->attrs.contains(rgw::tenant_cloud::config_attr) ||
-     same_metadata_version);
+  std::optional<rgw::tenant_cloud::Config> old_tenant_cloud_config;
+  if (old) {
+    ret = rgw::tenant_cloud::decode_config(old->attrs,
+                                           &old_tenant_cloud_config);
+    if (ret < 0) {
+      old_tenant_cloud_config.reset();
+    }
+  }
+  const bool tenant_cloud_active = tenant_cloud_config &&
+    tenant_cloud_config->enabled && old && old_tenant_cloud_config &&
+    old_tenant_cloud_config->config_generation ==
+      tenant_cloud_config->config_generation &&
+    !rgw::tenant_cloud::activation_required(old->attrs,
+                                             *tenant_cloud_config);
+  const bool tenant_cloud_activation = tenant_cloud_config &&
+    tenant_cloud_config->enabled && !tenant_cloud_active;
+  if (tenant_cloud_active) {
+    rgw::tenant_cloud::encode_activation(
+      tenant_cloud_config->config_generation, &bci.attrs);
+  } else {
+    bci.attrs.erase(rgw::tenant_cloud::activation_attr);
+  }
   ret = svc_bucket->store_bucket_instance_info(entry, bci.info, old_info, false,
                                                mtime, &bci.attrs, y, dpp,
                                                tenant_cloud_activation);

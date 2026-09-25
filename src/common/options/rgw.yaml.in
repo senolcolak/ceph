@@ -3413,6 +3413,13 @@ options:
   default: true
   services:
   - rgw
+- name: rgw_tenant_cloud_vault_allow_private_addr
+  type: bool
+  level: advanced
+  desc: Permit tenant-cloud Vault connections to private or special-use IP addresses. Disabled by default to prevent server-side request forgery; enable only for an operator-controlled private Vault endpoint.
+  default: false
+  services:
+  - rgw
 - name: rgw_tenant_cloud_vault_ssl_cacert
   type: str
   level: advanced
@@ -3436,6 +3443,8 @@ options:
   level: advanced
   desc: Maximum number of tenant-cloud credential entries cached by RGW.
   default: 1024
+  min: 1
+  max: 100000
   services:
   - rgw
 - name: rgw_tenant_cloud_credential_cache_ttl_secs
@@ -3443,6 +3452,8 @@ options:
   level: advanced
   desc: Maximum lifetime in seconds of a tenant-cloud credential cache entry.
   default: 300
+  min: 30
+  max: 86400
   services:
   - rgw
 - name: rgw_tenant_cloud_endpoint_allowlist

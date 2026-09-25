@@ -3,7 +3,9 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -14,6 +16,7 @@
 #include "rgw_tenant_cloud.h"
 #include "rgw_tenant_cloud_credentials.h"
 #include "rgw_vault_client.h"
+#include "rgw_crypt_sanitize.h"
 
 namespace tc = rgw::tenant_cloud;
 
@@ -181,14 +184,14 @@ TEST(RGWTenantCloud, decodes_previous_poc_attribute_layout)
   EXPECT_EQ(expected.source_zone_id, actual->source_zone_id);
 }
 
-TEST(RGWTenantCloud, rejects_unassigned_stored_generation)
+TEST(RGWTenantCloud, TreatsUnassignedStoredGenerationAsUnset)
 {
   auto invalid = valid_config();
   tc::Attrs attrs;
   tc::encode_config(invalid, &attrs);
 
   std::optional<tc::Config> config;
-  EXPECT_EQ(-EIO, tc::decode_config(attrs, &config));
+  EXPECT_EQ(0, tc::decode_config(attrs, &config));
   EXPECT_FALSE(config);
 }
 
@@ -208,6 +211,57 @@ TEST(RGWTenantCloud, assignsStableGenerationToImmutableConfig)
   next = valid_config();
   EXPECT_EQ(0, tc::advance_generation(std::nullopt, 7, &next));
   EXPECT_EQ(8, next.config_generation);
+
+  previous = valid_config();
+  previous.config_generation = 8;
+  next = previous;
+  next.enabled = false;
+  EXPECT_EQ(0, tc::advance_generation(previous, 8, &next));
+  EXPECT_EQ(9, next.config_generation);
+
+  previous = next;
+  next.enabled = true;
+  EXPECT_EQ(0, tc::advance_generation(previous, 9, &next));
+  EXPECT_EQ(10, next.config_generation);
+
+  previous.config_generation = std::numeric_limits<uint64_t>::max();
+  next = previous;
+  next.enabled = !previous.enabled;
+  EXPECT_EQ(-EOVERFLOW, tc::advance_generation(
+                          previous, previous.config_generation, &next));
+}
+
+TEST(RGWTenantCloud, TracksCompletedActivationGeneration)
+{
+  auto config = valid_config();
+  config.config_generation = 7;
+  tc::Attrs attrs;
+  EXPECT_TRUE(tc::activation_required(attrs, config));
+
+  tc::encode_activation(6, &attrs);
+  EXPECT_TRUE(tc::activation_required(attrs, config));
+  tc::encode_activation(7, &attrs);
+  EXPECT_FALSE(tc::activation_required(attrs, config));
+
+  config.enabled = false;
+  EXPECT_FALSE(tc::activation_required(attrs, config));
+  config.enabled = true;
+  attrs[tc::activation_attr].clear();
+  attrs[tc::activation_attr].append("invalid");
+  EXPECT_TRUE(tc::activation_required(attrs, config));
+}
+
+TEST(RGWTenantCloud, RedactsSessionTokenFromLogs)
+{
+  std::ostringstream header_log;
+  header_log << rgw::crypt_sanitize::x_meta_map{
+    "x-amz-security-token", "temporary-secret-token"};
+  EXPECT_EQ("=suppressed due to key presence=", header_log.str());
+
+  std::ostringstream canonical_log;
+  canonical_log << rgw::crypt_sanitize::log_content{
+    "host:s3.example.test\nx-amz-security-token:temporary-secret-token\n"};
+  EXPECT_EQ("=suppressed due to key presence=", canonical_log.str());
 }
 
 TEST(RGWTenantCloud, preservesGenerationAcrossDeleteAndRecreate)
@@ -319,6 +373,33 @@ TEST(RGWVaultClient, ValidatesTenantCloudConfiguration)
   EXPECT_EQ(-EINVAL, tc::validate_vault_config(config));
   config.ssl_clientkey = "/run/ceph/client.key";
   EXPECT_EQ(0, tc::validate_vault_config(config));
+
+  for (const auto* address : {"http://vault.example.test",
+                              "https://user@vault.example.test",
+                              "https://vault.example.test/path",
+                              "https://vault.example.test?query=1",
+                              "https://vault.example.test:0"}) {
+    config.address = address;
+    EXPECT_EQ(-EINVAL, tc::validate_vault_config(config)) << address;
+  }
+  config.address = "https://vault.example.test:8200";
+  EXPECT_EQ(0, tc::validate_vault_config(config));
+  config.verify_ssl = false;
+  EXPECT_EQ(-EINVAL, tc::validate_vault_config(config));
+  config.verify_ssl = true;
+  config.prefix = "v1/secret?query";
+  EXPECT_EQ(-EINVAL, tc::validate_vault_config(config));
+  config.prefix = "v1/../secret";
+  EXPECT_EQ(-EINVAL, tc::validate_vault_config(config));
+  config.prefix = "v1/secret";
+  config.namespace_name = "team\r\nX-Evil: true";
+  EXPECT_EQ(-EINVAL, tc::validate_vault_config(config));
+  config.namespace_name.clear();
+  config.address = "https://127.0.0.1:8200";
+  config.reject_prohibited_addresses = true;
+  EXPECT_EQ(-EINVAL, tc::validate_vault_config(config));
+  config.reject_prohibited_addresses = false;
+  EXPECT_EQ(0, tc::validate_vault_config(config));
 }
 
 TEST(RGWVaultClient, RejectsWhitespaceOnlyTokenFile)
@@ -335,6 +416,25 @@ TEST(RGWVaultClient, RejectsWhitespaceOnlyTokenFile)
   EXPECT_EQ(-EACCES, rgw::vault::testing::load_token(path, &token));
   EXPECT_TRUE(token.empty());
   EXPECT_EQ(0, std::remove(path));
+}
+
+TEST(RGWVaultClient, RejectsSymlinkTokenFile)
+{
+  char target_path[] = "/tmp/rgw-vault-token-target-XXXXXX";
+  const int fd = mkstemp(target_path);
+  ASSERT_GE(fd, 0);
+  constexpr std::string_view contents = "token-value\n";
+  ASSERT_EQ(static_cast<ssize_t>(contents.size()),
+            write(fd, contents.data(), contents.size()));
+  ASSERT_EQ(0, close(fd));
+
+  const std::string link_path = std::string{target_path} + ".link";
+  ASSERT_EQ(0, symlink(target_path, link_path.c_str()));
+  std::string token = "stale";
+  EXPECT_EQ(-ELOOP, rgw::vault::testing::load_token(link_path, &token));
+  EXPECT_TRUE(token.empty());
+  EXPECT_EQ(0, std::remove(link_path.c_str()));
+  EXPECT_EQ(0, std::remove(target_path));
 }
 
 TEST(RGWVaultClient, ReturnsZeroForValidToken)

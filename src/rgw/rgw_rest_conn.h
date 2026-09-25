@@ -14,6 +14,7 @@
 enum class RGWEndpointSelectionPolicy {
   allow_fallback,
   require_pinned,
+  defer_to_curl,
 };
 
 class RGWSI_Zone;

@@ -242,11 +242,13 @@ class RGWTenantCloudResolvedProvider final
         inflight = parent->join_resolution(cache_key, &leader);
         if (!leader) {
           while (!parent->consume_resolution(inflight, result, &retcode)) {
-            yield wait(utime_t{0, 10000});
+            yield wait(utime_t{0, 10000000});
           }
           return retcode < 0 ? set_cr_error(retcode) : set_cr_done();
         }
-        operation.reset(resolver->resolve(owner, config, &credentials));
+        operation.reset(resolver->resolve(
+          sync->env ? sync->env->http_manager : nullptr, owner, config,
+          &credentials));
         if (!operation) {
           parent->finish_resolution(cache_key, inflight, -EINVAL, {});
           return set_cr_error(-EINVAL);
@@ -727,7 +729,7 @@ int build_target_context(CephContext* cct,
                            credentials.secret_key,
                            credentials.session_token),
     source_zonegroup_id, config.region, PathStyle,
-    RGWEndpointSelectionPolicy::require_pinned,
+    RGWEndpointSelectionPolicy::defer_to_curl,
     RGWEndpointAddressPolicy::reject_prohibited);
   auto target = rgw::sync::s3::make_rest_target(conn);
   if (!target) {
@@ -845,10 +847,17 @@ std::unique_ptr<RGWDataSyncModule> make_data_sync_module(
 } // namespace rgw::tenant_cloud
 
 int RGWTenantCloudSyncModule::create_instance(
-  const DoutPrefixProvider*, CephContext* cct, const JSONFormattable&,
+  const DoutPrefixProvider* dpp, CephContext* cct,
+  const JSONFormattable& config,
   RGWSyncModuleInstanceRef* instance)
 {
   if (!cct || !instance) {
+    return -EINVAL;
+  }
+  if (!config.object().empty()) {
+    ldpp_dout(dpp, -1)
+      << "ERROR: tenant-cloud zone-tier configuration is not supported; "
+         "use rgw_tenant_cloud_* daemon options" << dendl;
     return -EINVAL;
   }
   RGWVaultConfig vault_config{
@@ -870,6 +879,9 @@ int RGWTenantCloudSyncModule::create_instance(
       "rgw_tenant_cloud_vault_ssl_clientkey"),
     .verify_ssl = cct->_conf.get_val<bool>(
       "rgw_tenant_cloud_vault_verify_ssl"),
+    .reject_prohibited_addresses =
+      !cct->_conf.get_val<bool>(
+        "rgw_tenant_cloud_vault_allow_private_addr"),
   };
   if (rgw::tenant_cloud::validate_vault_config(vault_config) < 0) {
     return -EINVAL;
@@ -879,6 +891,11 @@ int RGWTenantCloudSyncModule::create_instance(
   const auto credential_cache_ttl = std::chrono::seconds{
     cct->_conf.get_val<uint64_t>(
       "rgw_tenant_cloud_credential_cache_ttl_secs")};
+  if (credential_cache_size == 0 || credential_cache_size > 100000 ||
+      credential_cache_ttl < std::chrono::seconds{30} ||
+      credential_cache_ttl > std::chrono::hours{24}) {
+    return -EINVAL;
+  }
   auto credentials = std::make_shared<rgw::tenant_cloud::VaultCredentialResolver>(
     cct, std::move(vault_config),
     std::make_shared<rgw::tenant_cloud::CredentialCache>(

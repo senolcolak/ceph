@@ -1737,6 +1737,16 @@ void RGWPutBucketReplication::execute(optional_yield y) {
   }
 
   op_ret = retry_raced_bucket_write(this, s->bucket.get(), [this, y] {
+    auto& attrs = s->bucket->get_attrs();
+    const bool had_tenant_cloud_config =
+      attrs.contains(rgw::tenant_cloud::config_attr);
+    if (!tenant_cloud_config && had_tenant_cloud_config) {
+      tenant_cloud_master_result = true;
+      s->err.message =
+        "Remove tenant-cloud replication before replacing it with a standard replication configuration";
+      return -ERR_INVALID_BUCKET_STATE;
+    }
+
     auto sync_policy = (s->bucket->get_info().sync_policy ? *s->bucket->get_info().sync_policy : rgw_sync_policy_info());
     for (auto& group : sync_policy_groups) {
       sync_policy.groups[group.id] = group;
@@ -1759,15 +1769,12 @@ void RGWPutBucketReplication::execute(optional_yield y) {
       }
     }
 
-    auto& attrs = s->bucket->get_attrs();
-    const bool had_tenant_cloud_config =
-      attrs.contains(rgw::tenant_cloud::config_attr);
     if (!tenant_cloud_master_result.has_value()) {
       tenant_cloud_master_result =
         tenant_cloud_config.has_value() || had_tenant_cloud_config;
     }
+    std::optional<rgw::tenant_cloud::Config> previous_config;
     if (tenant_cloud_config) {
-      std::optional<rgw::tenant_cloud::Config> previous_config;
       int ret = rgw::tenant_cloud::decode_config(attrs, &previous_config);
       if (ret < 0) {
         ldpp_dout(this, 0) << "ERROR: failed to decode tenant-cloud bucket configuration" << dendl;
@@ -1797,13 +1804,17 @@ void RGWPutBucketReplication::execute(optional_yield y) {
 
     s->bucket->get_info().set_sync_policy(std::move(sync_policy));
 
-    const bool tenant_cloud_activation =
-      tenant_cloud_config && tenant_cloud_config->enabled;
+    const bool tenant_cloud_activation = tenant_cloud_config &&
+      rgw::tenant_cloud::activation_required(attrs, *tenant_cloud_config);
     int ret = s->bucket->put_info_with_activation(
       this, false, real_time(), y, tenant_cloud_activation);
     if (ret < 0) {
       ldpp_dout(this, 0) << "ERROR: put_bucket_instance_info (bucket=" << s->bucket << ") returned ret=" << ret << dendl;
       return ret;
+    }
+    if (tenant_cloud_activation) {
+      rgw::tenant_cloud::encode_activation(
+        tenant_cloud_config->config_generation, &attrs);
     }
 
     return 0;
@@ -1865,6 +1876,9 @@ void RGWDeleteBucketReplication::execute(optional_yield y)
     }
     const bool removed_tenant_cloud_config =
       attrs.erase(rgw::tenant_cloud::config_attr) > 0;
+    attrs.erase(rgw::tenant_cloud::activation_attr);
+    // Keep epoch_attr so a later recreation cannot reuse a generation held by
+    // an in-flight worker or cached target context.
     if (!s->bucket->get_info().sync_policy) {
       if (!removed_tenant_cloud_config) {
         return 0;

@@ -73,27 +73,33 @@ int decode_rest_obj(const DoutPrefixProvider* dpp,
                       << (error.empty() ? "" : ": ") << error << dendl;
     return -EIO;
   }
-  info->content_len = content_len;
+  std::map<std::string, std::string> decoded_headers;
   for (const auto& [name, value] : headers) {
     if (name != "RGWX_OBJECT_SIZE") {
-      info->attrs[name] = value;
+      decoded_headers[name] = value;
     }
   }
 
   auto acl = attrs.find(RGW_ATTR_ACL);
   if (acl == attrs.end()) {
     ldpp_dout(dpp, 0) << "WARNING: acl attrs not provided" << dendl;
+    info->content_len = content_len;
+    info->attrs = std::move(decoded_headers);
     return 0;
   }
 
   auto iter = acl->second.cbegin();
+  RGWAccessControlPolicy decoded_acl;
   try {
-    info->acls.decode(iter);
+    decoded_acl.decode(iter);
   } catch (const buffer::error&) {
     ldpp_dout(dpp, 0) << "ERROR: failed to decode policy from attrs"
                       << dendl;
     return -EIO;
   }
+  info->content_len = content_len;
+  info->attrs = std::move(decoded_headers);
+  info->acls = std::move(decoded_acl);
   return 0;
 }
 

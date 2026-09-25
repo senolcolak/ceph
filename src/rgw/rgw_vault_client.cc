@@ -1,13 +1,16 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
 #include "rgw_vault_client.h"
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
 
 #include "common/ceph_crypto.h"
 #include "common/safe_io.h"
+#include "rgw_secure_endpoint_resolver.h"
 #ifdef WITH_RADOSGW_RADOS
 #include "rgw_coroutine.h"
 #endif
@@ -63,6 +66,7 @@ void append_url(std::string& url, std::string_view path)
 #ifdef WITH_RADOSGW_RADOS
 class VaultRequestCR final : public RGWCoroutine {
   CephContext* cct;
+  RGWHTTPManager* http_manager;
   RGWVaultConfig config;
   std::string method;
   std::string path;
@@ -71,22 +75,24 @@ class VaultRequestCR final : public RGWCoroutine {
   std::unique_ptr<BoundedVaultResponse> request;
 
 public:
-  VaultRequestCR(CephContext* cct, RGWVaultConfig config, const char* method,
-                std::string path, std::string postdata, bufferlist* response)
-    : RGWCoroutine(cct), cct(cct), config(std::move(config)),
+  VaultRequestCR(CephContext* cct, RGWHTTPManager* http_manager,
+                RGWVaultConfig config, const char* method, std::string path,
+                std::string postdata, bufferlist* response)
+    : RGWCoroutine(cct), cct(cct), http_manager(http_manager),
+      config(std::move(config)),
       method(method ? method : ""),
       path(std::move(path)), postdata(std::move(postdata)), response(response) {}
 
   int operate(const DoutPrefixProvider* dpp) override
   {
     reenter(this) {
-      if (!cct || method.empty() || path.empty() || !response ||
+      if (!cct || !http_manager || method.empty() || path.empty() || !response ||
           config.address.empty()) {
         return set_cr_error(-EINVAL);
       }
 
       if (!request) {
-        {
+        yield {
           std::string url = config.address;
           append_url(url, config.prefix);
           append_url(url, path);
@@ -100,6 +106,10 @@ public:
 
           RGWEndpoint endpoint;
           endpoint.set_url(url);
+          if (config.reject_prohibited_addresses) {
+            endpoint.set_address_policy(
+              RGWEndpointAddressPolicy::reject_prohibited);
+          }
           request = std::make_unique<BoundedVaultResponse>(
             cct, method, endpoint, response, 128 * 1024);
           if (!postdata.empty()) {
@@ -117,14 +127,16 @@ public:
           if (!config.ssl_cacert.empty()) request->set_ca_path(config.ssl_cacert);
           if (!config.ssl_clientcert.empty()) request->set_client_cert(config.ssl_clientcert);
           if (!config.ssl_clientkey.empty()) request->set_client_key(config.ssl_clientkey);
-          const int ret = RGWHTTP::send(request.get());
+          init_new_io(request.get());
+          const int ret = http_manager->add_request(request.get());
           if (ret < 0) {
             return set_cr_error(ret);
           }
+          return io_block(0);
         }
       }
-      while (!request->is_done()) {
-        yield wait(utime_t{0, 10000000});
+      if (!request->is_done()) {
+        return set_cr_error(-EIO);
       }
       if (is_vault_auth_failure(request->get_http_status())) {
         return set_cr_error(-EACCES);
@@ -143,22 +155,36 @@ int load_token(const std::string& path, std::string* token)
     return -EINVAL;
   }
   token->clear();
-  struct stat token_st;
   if (path.empty()) {
     return -EINVAL;
   }
-  if (stat(path.c_str(), &token_st) != 0) {
-    return -ENOENT;
+  const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) {
+    return -errno;
   }
-  if (token_st.st_mode & (S_IWGRP | S_IXGRP | S_IRWXO)) {
+  struct stat token_st;
+  if (fstat(fd, &token_st) != 0) {
+    const int error = -errno;
+    close(fd);
+    return error;
+  }
+  if (!S_ISREG(token_st.st_mode) ||
+      token_st.st_mode & (S_IWGRP | S_IXGRP | S_IRWXO)) {
+    close(fd);
     return -EACCES;
   }
 
   char buf[2048];
-  const int ret = safe_read_file("", path.c_str(), buf, sizeof(buf));
+  const int ret = safe_read(fd, buf, sizeof(buf));
+  const int close_ret = close(fd);
+  const int close_error = errno;
   if (ret < 0) {
     ::ceph::crypto::zeroize_for_security(buf, sizeof(buf));
     return ret;
+  }
+  if (close_ret < 0) {
+    ::ceph::crypto::zeroize_for_security(buf, sizeof(buf));
+    return -close_error;
   }
   int length = ret;
   while (length && std::isspace(static_cast<unsigned char>(buf[length - 1]))) {
@@ -214,6 +240,9 @@ int RGWVaultClient::request(const DoutPrefixProvider* dpp, const char* method,
   static constexpr size_t max_response_size = 128 * 1024;
   RGWEndpoint endpoint;
   endpoint.set_url(url);
+  if (config.reject_prohibited_addresses) {
+    endpoint.set_address_policy(RGWEndpointAddressPolicy::reject_prohibited);
+  }
   BoundedVaultResponse request(cct, method, endpoint, &response,
                                max_response_size);
   if (!postdata.empty()) {
@@ -246,15 +275,17 @@ int RGWVaultClient::request(const DoutPrefixProvider* dpp, const char* method,
 }
 
 #ifdef WITH_RADOSGW_RADOS
-RGWCoroutine* RGWVaultClient::request_async(const char* method,
+RGWCoroutine* RGWVaultClient::request_async(RGWHTTPManager* http_manager,
+                                             const char* method,
                                              std::string_view path,
                                              std::string postdata,
                                              bufferlist* response) const
 {
-  if (!cct || !method || !*method || path.empty() || !response) {
+  if (!cct || !http_manager || !method || !*method || path.empty() ||
+      !response) {
     return nullptr;
   }
-  return new VaultRequestCR(cct, config, method, std::string(path),
+  return new VaultRequestCR(cct, http_manager, config, method, std::string(path),
                             std::move(postdata), response);
 }
 #endif

@@ -17,7 +17,8 @@ int parse_vault_credentials(bufferlist& response, Credentials* result);
 class CredentialResolver {
 public:
   virtual ~CredentialResolver() = default;
-  virtual RGWCoroutine* resolve(rgw_owner owner, Config config,
+  virtual RGWCoroutine* resolve(RGWHTTPManager* http_manager,
+                                rgw_owner owner, Config config,
                                 Credentials* result) = 0;
   virtual void invalidate(rgw_owner, const Config&) {}
 };
@@ -67,7 +68,8 @@ public:
     : cct(cct), vault_config(std::move(config)),
       cache(cache ? std::move(cache) : std::make_shared<CredentialCache>()) {}
 
-  RGWCoroutine* resolve(rgw_owner owner, Config config,
+  RGWCoroutine* resolve(RGWHTTPManager* http_manager,
+                        rgw_owner owner, Config config,
                         Credentials* result) override;
   void invalidate(rgw_owner owner, const Config& config) override;
 };

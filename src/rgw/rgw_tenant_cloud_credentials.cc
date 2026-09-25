@@ -2,13 +2,18 @@
 
 #include <cerrno>
 #include <algorithm>
+#include <charconv>
+#include <cctype>
 #include <memory>
 #include <string_view>
+
+#include <boost/url/parse.hpp>
 
 #include "common/ceph_json.h"
 #include "common/ceph_crypto.h"
 #include "rgw_common.h"
 #include "rgw_coroutine.h"
+#include "rgw_secure_endpoint_resolver.h"
 
 #include <boost/asio/yield.hpp>
 
@@ -53,15 +58,65 @@ bool valid_header_value(std::string_view value)
       return c < 0x20 || c == 0x7f;
     });
 }
+
+bool valid_vault_component(std::string_view value)
+{
+  if (!std::all_of(value.begin(), value.end(), [](unsigned char c) {
+    return std::isalnum(c) || c == '/' || c == '-' || c == '_' || c == '.';
+  })) {
+    return false;
+  }
+  while (!value.empty()) {
+    const auto separator = value.find('/');
+    const auto segment = value.substr(0, separator);
+    if (segment == "." || segment == "..") {
+      return false;
+    }
+    if (separator == std::string_view::npos) {
+      break;
+    }
+    value.remove_prefix(separator + 1);
+  }
+  return true;
+}
 }
 
 int validate_vault_config(const RGWVaultConfig& config)
 {
-  if (config.address.empty() ||
+  const auto address = boost::urls::parse_uri(config.address);
+  if (!address || address->scheme() != "https" ||
+      !address->has_authority() || address->host().empty() ||
+      address->has_userinfo() || address->has_query() ||
+      address->has_fragment() ||
+      (!address->path().empty() && address->path() != "/") ||
+      config.address.size() > 2048 || !config.verify_ssl ||
       (config.auth != "token" && config.auth != "agent") ||
       (config.auth == "token" && config.token_file.empty()) ||
-      config.ssl_clientcert.empty() != config.ssl_clientkey.empty()) {
+      config.ssl_clientcert.empty() != config.ssl_clientkey.empty() ||
+      !valid_vault_component(config.prefix) ||
+      !valid_vault_component(config.namespace_name)) {
     return -EINVAL;
+  }
+  if (address->has_port()) {
+    unsigned port = 0;
+    const auto text = address->port();
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(),
+                                        port);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+        port == 0 || port > 65535) {
+      return -EINVAL;
+    }
+  }
+  if (config.reject_prohibited_addresses) {
+    std::string host{address->host()};
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+      host = host.substr(1, host.size() - 2);
+    }
+    boost::system::error_code ec;
+    const auto ip = boost::asio::ip::make_address(host, ec);
+    if (!ec && rgw::secure_endpoint::is_prohibited_address(ip)) {
+      return -EINVAL;
+    }
   }
   return 0;
 }
@@ -240,6 +295,7 @@ namespace {
 
 class ResolveCR final : public RGWCoroutine {
   RGWVaultClient client;
+  RGWHTTPManager* http_manager;
   rgw_owner owner;
   Config config;
   Credentials* result;
@@ -251,11 +307,13 @@ class ResolveCR final : public RGWCoroutine {
   std::unique_ptr<RGWCoroutine> operation;
 
 public:
-  ResolveCR(CephContext* cct, RGWVaultConfig vault_config,
+  ResolveCR(CephContext* cct, RGWHTTPManager* http_manager,
+            RGWVaultConfig vault_config,
             rgw_owner owner, Config config, Credentials* result,
             std::shared_ptr<CredentialCache> cache)
     : RGWCoroutine(cct), client(cct, std::move(vault_config)),
-      owner(std::move(owner)), config(std::move(config)), result(result),
+      http_manager(http_manager), owner(std::move(owner)),
+      config(std::move(config)), result(result),
       cache(std::move(cache)) {}
 
   ~ResolveCR() override
@@ -267,7 +325,7 @@ public:
   int operate(const DoutPrefixProvider*) override
   {
     reenter(this) {
-      if (!result || validate(config, nullptr) < 0) {
+      if (!http_manager || !result || validate(config, nullptr) < 0) {
         return set_cr_error(-EINVAL);
       }
       cache_key = credential_cache_key(owner, config.credential_ref);
@@ -281,7 +339,8 @@ public:
         const std::string logical = config.credential_ref.substr(8);
         const std::string path = url_encode(to_string(owner), true) + "/" +
                                  url_encode(logical, true);
-        operation.reset(client.request_async("GET", path, {}, &response));
+        operation.reset(client.request_async(
+          http_manager, "GET", path, {}, &response));
       }
       if (!operation) return set_cr_error(-EINVAL);
       yield call(operation.release());
@@ -319,10 +378,13 @@ public:
 } // anonymous namespace
 
 RGWCoroutine* VaultCredentialResolver::resolve(
-  rgw_owner owner, Config config, Credentials* result)
+  RGWHTTPManager* http_manager, rgw_owner owner, Config config,
+  Credentials* result)
 {
-  if (!cct || validate_vault_config(vault_config) < 0) return nullptr;
-  return new ResolveCR(cct, vault_config, std::move(owner),
+  if (!cct || !http_manager || validate_vault_config(vault_config) < 0) {
+    return nullptr;
+  }
+  return new ResolveCR(cct, http_manager, vault_config, std::move(owner),
                        std::move(config), result, cache);
 }
 
