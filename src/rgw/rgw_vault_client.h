@@ -10,6 +10,7 @@
 
 class CephContext;
 class DoutPrefixProvider;
+class RGWAsyncRadosProcessor;
 class RGWCoroutine;
 
 struct RGWVaultConfig {
@@ -44,6 +45,7 @@ public:
               optional_yield y, bufferlist& response) const;
 #ifdef WITH_RADOSGW_RADOS
   RGWCoroutine* request_async(RGWHTTPManager* http_manager,
+                              RGWAsyncRadosProcessor* async_processor,
                               const char* method, std::string_view path,
                               std::string postdata,
                               bufferlist* response) const;

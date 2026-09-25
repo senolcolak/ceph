@@ -9,6 +9,8 @@
 #include <mutex>
 #include <unordered_map>
 
+class RGWAsyncRadosProcessor;
+
 namespace rgw::tenant_cloud {
 
 int validate_vault_config(const RGWVaultConfig& config);
@@ -18,6 +20,7 @@ class CredentialResolver {
 public:
   virtual ~CredentialResolver() = default;
   virtual RGWCoroutine* resolve(RGWHTTPManager* http_manager,
+                                RGWAsyncRadosProcessor* async_processor,
                                 rgw_owner owner, Config config,
                                 Credentials* result) = 0;
   virtual void invalidate(rgw_owner, const Config&) {}
@@ -69,6 +72,7 @@ public:
       cache(cache ? std::move(cache) : std::make_shared<CredentialCache>()) {}
 
   RGWCoroutine* resolve(RGWHTTPManager* http_manager,
+                        RGWAsyncRadosProcessor* async_processor,
                         rgw_owner owner, Config config,
                         Credentials* result) override;
   void invalidate(rgw_owner owner, const Config& config) override;

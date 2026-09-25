@@ -12,7 +12,7 @@
 #include "common/safe_io.h"
 #include "rgw_secure_endpoint_resolver.h"
 #ifdef WITH_RADOSGW_RADOS
-#include "rgw_coroutine.h"
+#include "driver/rados/rgw_cr_rados.h"
 #endif
 
 #ifdef WITH_RADOSGW_RADOS
@@ -44,6 +44,13 @@ public:
 
 int load_token(const std::string& path, std::string* token);
 
+void wipe(std::string& value)
+{
+  if (!value.empty()) {
+    ::ceph::crypto::zeroize_for_security(value.data(), value.size());
+  }
+}
+
 bool is_vault_auth_failure(long status)
 {
   return status == 401 || status == 403;
@@ -64,24 +71,58 @@ void append_url(std::string& url, std::string_view path)
 }
 
 #ifdef WITH_RADOSGW_RADOS
+class TokenReadAction final : public RGWGenericAsyncCR::Action {
+  std::string path;
+  std::string token;
+
+public:
+  explicit TokenReadAction(std::string path) : path(std::move(path)) {}
+
+  ~TokenReadAction() override
+  {
+    wipe(token);
+  }
+
+  int operate() override
+  {
+    return load_token(path, &token);
+  }
+
+  std::string take_token()
+  {
+    return std::move(token);
+  }
+};
+
 class VaultRequestCR final : public RGWCoroutine {
   CephContext* cct;
   RGWHTTPManager* http_manager;
+  RGWAsyncRadosProcessor* async_processor;
   RGWVaultConfig config;
   std::string method;
   std::string path;
   std::string postdata;
   bufferlist* response;
+  std::string token;
+  std::shared_ptr<TokenReadAction> token_read;
+  bool token_loaded{false};
   std::unique_ptr<BoundedVaultResponse> request;
 
 public:
   VaultRequestCR(CephContext* cct, RGWHTTPManager* http_manager,
+                RGWAsyncRadosProcessor* async_processor,
                 RGWVaultConfig config, const char* method, std::string path,
                 std::string postdata, bufferlist* response)
     : RGWCoroutine(cct), cct(cct), http_manager(http_manager),
+      async_processor(async_processor),
       config(std::move(config)),
       method(method ? method : ""),
       path(std::move(path)), postdata(std::move(postdata)), response(response) {}
+
+  ~VaultRequestCR() override
+  {
+    wipe(token);
+  }
 
   int operate(const DoutPrefixProvider* dpp) override
   {
@@ -90,19 +131,24 @@ public:
           config.address.empty()) {
         return set_cr_error(-EINVAL);
       }
+      if (!token_loaded) {
+        if (config.auth == "token") {
+          token_read = std::make_shared<TokenReadAction>(config.token_file);
+          yield call(new RGWGenericAsyncCR(cct, async_processor, token_read));
+          if (retcode < 0) {
+            return set_cr_error(retcode);
+          }
+          token = token_read->take_token();
+          token_read.reset();
+        }
+        token_loaded = true;
+      }
 
       if (!request) {
         yield {
           std::string url = config.address;
           append_url(url, config.prefix);
           append_url(url, path);
-          std::string token;
-          if (config.auth == "token") {
-            const int ret = load_token(config.token_file, &token);
-            if (ret < 0) {
-              return set_cr_error(ret);
-            }
-          }
 
           RGWEndpoint endpoint;
           endpoint.set_url(url);
@@ -276,16 +322,18 @@ int RGWVaultClient::request(const DoutPrefixProvider* dpp, const char* method,
 
 #ifdef WITH_RADOSGW_RADOS
 RGWCoroutine* RGWVaultClient::request_async(RGWHTTPManager* http_manager,
+                                             RGWAsyncRadosProcessor* async_processor,
                                              const char* method,
                                              std::string_view path,
                                              std::string postdata,
                                              bufferlist* response) const
 {
-  if (!cct || !http_manager || !method || !*method || path.empty() ||
-      !response) {
+  if (!cct || !http_manager ||
+      (config.auth == "token" && !async_processor) || !method || !*method ||
+      path.empty() || !response) {
     return nullptr;
   }
-  return new VaultRequestCR(cct, http_manager, config, method, std::string(path),
-                            std::move(postdata), response);
+  return new VaultRequestCR(cct, http_manager, async_processor, config, method,
+                            std::string(path), std::move(postdata), response);
 }
 #endif

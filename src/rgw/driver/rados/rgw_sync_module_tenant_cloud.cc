@@ -247,7 +247,8 @@ class RGWTenantCloudResolvedProvider final
           return retcode < 0 ? set_cr_error(retcode) : set_cr_done();
         }
         operation.reset(resolver->resolve(
-          sync->env ? sync->env->http_manager : nullptr, owner, config,
+          sync->env ? sync->env->http_manager : nullptr,
+          sync->env ? sync->env->async_rados : nullptr, owner, config,
           &credentials));
         if (!operation) {
           parent->finish_resolution(cache_key, inflight, -EINVAL, {});

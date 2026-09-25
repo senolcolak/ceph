@@ -249,8 +249,8 @@ public:
   unsigned resolve_count{0};
   unsigned invalidate_count{0};
 
-  RGWCoroutine* resolve(RGWHTTPManager*, rgw_owner, tc::Config,
-                        tc::Credentials*) override
+  RGWCoroutine* resolve(RGWHTTPManager*, RGWAsyncRadosProcessor*, rgw_owner,
+                        tc::Config, tc::Credentials*) override
   {
     ++resolve_count;
     return new DelayedErrorCR(g_ceph_context, -EIO);

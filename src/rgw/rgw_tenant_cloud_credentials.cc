@@ -296,6 +296,7 @@ namespace {
 class ResolveCR final : public RGWCoroutine {
   RGWVaultClient client;
   RGWHTTPManager* http_manager;
+  RGWAsyncRadosProcessor* async_processor;
   rgw_owner owner;
   Config config;
   Credentials* result;
@@ -308,11 +309,13 @@ class ResolveCR final : public RGWCoroutine {
 
 public:
   ResolveCR(CephContext* cct, RGWHTTPManager* http_manager,
+            RGWAsyncRadosProcessor* async_processor,
             RGWVaultConfig vault_config,
             rgw_owner owner, Config config, Credentials* result,
             std::shared_ptr<CredentialCache> cache)
     : RGWCoroutine(cct), client(cct, std::move(vault_config)),
-      http_manager(http_manager), owner(std::move(owner)),
+      http_manager(http_manager), async_processor(async_processor),
+      owner(std::move(owner)),
       config(std::move(config)), result(result),
       cache(std::move(cache)) {}
 
@@ -325,7 +328,8 @@ public:
   int operate(const DoutPrefixProvider*) override
   {
     reenter(this) {
-      if (!http_manager || !result || validate(config, nullptr) < 0) {
+      if (!http_manager || !async_processor || !result ||
+          validate(config, nullptr) < 0) {
         return set_cr_error(-EINVAL);
       }
       cache_key = credential_cache_key(owner, config.credential_ref);
@@ -340,7 +344,7 @@ public:
         const std::string path = url_encode(to_string(owner), true) + "/" +
                                  url_encode(logical, true);
         operation.reset(client.request_async(
-          http_manager, "GET", path, {}, &response));
+          http_manager, async_processor, "GET", path, {}, &response));
       }
       if (!operation) return set_cr_error(-EINVAL);
       yield call(operation.release());
@@ -378,14 +382,15 @@ public:
 } // anonymous namespace
 
 RGWCoroutine* VaultCredentialResolver::resolve(
-  RGWHTTPManager* http_manager, rgw_owner owner, Config config,
-  Credentials* result)
+  RGWHTTPManager* http_manager, RGWAsyncRadosProcessor* async_processor,
+  rgw_owner owner, Config config, Credentials* result)
 {
-  if (!cct || !http_manager || validate_vault_config(vault_config) < 0) {
+  if (!cct || !http_manager || !async_processor ||
+      validate_vault_config(vault_config) < 0) {
     return nullptr;
   }
-  return new ResolveCR(cct, http_manager, vault_config, std::move(owner),
-                       std::move(config), result, cache);
+  return new ResolveCR(cct, http_manager, async_processor, vault_config,
+                       std::move(owner), std::move(config), result, cache);
 }
 
 void VaultCredentialResolver::invalidate(rgw_owner owner,
