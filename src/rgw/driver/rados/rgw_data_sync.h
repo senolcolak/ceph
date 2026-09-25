@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <functional>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 
@@ -34,6 +35,17 @@ struct rgw_data_sync_obligation {
   ceph::real_time timestamp;
   bool retry = false;
 };
+
+namespace rgw::data_sync {
+
+using MarkerFinishFactory = std::function<RGWCoroutine*()>;
+
+// Persist retry ownership before allowing the outer data-log marker to finish.
+RGWCoroutine* persist_retry_before_marker(
+    CephContext* cct, RGWCoroutine* retry_write,
+    MarkerFinishFactory finish_marker);
+
+} // namespace rgw::data_sync
 
 inline std::ostream& operator<<(std::ostream& out, const rgw_data_sync_obligation& o) {
   out << "key=" << o.bs;

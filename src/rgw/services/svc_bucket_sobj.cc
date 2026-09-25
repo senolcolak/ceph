@@ -13,6 +13,7 @@
 #include "rgw_bucket.h"
 #include "rgw_metadata_lister.h"
 #include "rgw_string.h"
+#include "rgw_tenant_cloud.h"
 #include "driver/rados/rgw_tools.h"
 #include "rgw_zone.h"
 
@@ -434,7 +435,8 @@ int RGWSI_Bucket_SObj::store_bucket_instance_info(const string& key,
                                                   real_time mtime,
                                                   const map<string, bufferlist> *pattrs,
                                                   optional_yield y,
-                                                  const DoutPrefixProvider *dpp)
+                                                  const DoutPrefixProvider *dpp,
+                                                  bool tenant_cloud_activation)
 {
   bufferlist bl;
   encode(info, bl);
@@ -462,6 +464,17 @@ int RGWSI_Bucket_SObj::store_bucket_instance_info(const string& key,
     }
   }
 
+  if (tenant_cloud_activation) {
+    if (!pattrs) {
+      return -EINVAL;
+    }
+    const int r = svc.bi->validate_sync_policy_update(
+      dpp, info, tenant_cloud_activation);
+    if (r < 0) {
+      return r;
+    }
+  }
+
   if (orig_info && *orig_info && !exclusive) {
     int r = svc.bi->handle_overwrite(dpp, info, *(orig_info.value()), y);
     if (r < 0) {
@@ -472,19 +485,57 @@ int RGWSI_Bucket_SObj::store_bucket_instance_info(const string& key,
 
   const rgw_pool& pool = svc.zone->get_zone_params().domain_root;
   const std::string oid = instance_meta_key_to_oid(key);
+  std::optional<std::map<std::string, bufferlist>> pending_attrs;
+  const auto* write_attrs = pattrs;
+  if (tenant_cloud_activation) {
+    pending_attrs = *pattrs;
+    pending_attrs->erase(rgw::tenant_cloud::activation_attr);
+    write_attrs = &*pending_attrs;
+  }
   int ret = rgw_put_system_obj(dpp, svc.sysobj, pool, oid, bl, exclusive,
-                               &info.objv_tracker, mtime, y, pattrs);
+                               &info.objv_tracker, mtime, y, write_attrs);
   if (ret >= 0) {
-    int r = svc.mdlog->complete_entry(dpp, y, "bucket.instance",
-                                      key, &info.objv_tracker);
-    if (r < 0) {
-      return r;
+    int r;
+    if (tenant_cloud_activation) {
+      // Publish the new pipe before its initial data-log entries are visible.
+      r = svc.bucket_sync->handle_bi_update(
+        dpp, info, orig_info.value_or(nullptr), y);
+      if (r < 0) {
+        return r;
+      }
+      r = svc.bi->handle_sync_policy_update(
+        dpp, info, tenant_cloud_activation, y);
+      if (r < 0) {
+        return r;
+      }
+      auto activated_attrs = *pattrs;
+      std::optional<rgw::tenant_cloud::Config> config;
+      r = rgw::tenant_cloud::decode_config(activated_attrs, &config);
+      if (r < 0 || !config || !config->enabled) {
+        return r < 0 ? r : -EINVAL;
+      }
+      rgw::tenant_cloud::encode_activation(config->config_generation,
+                                            &activated_attrs);
+      r = rgw_put_system_obj(dpp, svc.sysobj, pool, oid, bl, false,
+                             &info.objv_tracker, mtime, y, &activated_attrs);
+      if (r < 0) {
+        return r;
+      }
     }
 
-    r = svc.bucket_sync->handle_bi_update(dpp, info, orig_info.value_or(nullptr), y);
+    r = svc.mdlog->complete_entry(dpp, y, "bucket.instance",
+                                  key, &info.objv_tracker);
     if (r < 0) {
       return r;
     }
+    if (!tenant_cloud_activation) {
+      r = svc.bucket_sync->handle_bi_update(
+        dpp, info, orig_info.value_or(nullptr), y);
+      if (r < 0) {
+        return r;
+      }
+    }
+
   } else if (ret == -EEXIST) {
     /* well, if it's exclusive we shouldn't overwrite it, because we might race with another
      * bucket operation on this specific bucket (e.g., being synced from the master), but

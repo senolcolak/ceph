@@ -1046,3 +1046,50 @@ int RGWSI_BucketIndex_RADOS::handle_overwrite(const DoutPrefixProvider *dpp,
 
   return ret;
 }
+
+int RGWSI_BucketIndex_RADOS::handle_sync_policy_update(
+    const DoutPrefixProvider* dpp, const RGWBucketInfo& info,
+    bool tenant_cloud_activation, optional_yield y)
+{
+  int ret = validate_sync_policy_update(dpp, info, tenant_cloud_activation);
+  if (ret < 0 || !tenant_cloud_activation) {
+    return ret;
+  }
+  const auto& bilog = info.layout.logs.back();
+  const int shards_num = rgw::num_shards(bilog.layout.in_index);
+  for (int shard = 0; shard < shards_num; ++shard) {
+    ret = svc.datalog_rados->add_entry(
+      dpp, info, bilog, shard, y);
+    if (ret < 0) {
+      ldpp_dout(dpp, -1) << "ERROR: failed scheduling initial bucket sync"
+                          << " (bucket=" << info.bucket
+                          << ", shard=" << shard << ") ret="
+                          << ret << dendl;
+      return ret;
+    }
+  }
+  return 0;
+}
+
+int RGWSI_BucketIndex_RADOS::validate_sync_policy_update(
+    const DoutPrefixProvider* dpp, const RGWBucketInfo& info,
+    bool tenant_cloud_activation)
+{
+  if (!tenant_cloud_activation) {
+    return 0;
+  }
+  if (!info.sync_policy || info.sync_policy->empty() ||
+      info.layout.logs.empty() ||
+      info.layout.logs.back().layout.type != rgw::BucketLogType::InIndex ||
+      rgw::num_shards(info.layout.logs.back().layout.in_index) <= 0) {
+    ldpp_dout(dpp, -1) << "ERROR: tenant-cloud activation requires an"
+                        << " in-index bucket data log" << dendl;
+    return -EOPNOTSUPP;
+  }
+  if (!svc.datalog_rados) {
+    ldpp_dout(dpp, -1) << "ERROR: tenant-cloud activation has no data-log service"
+                        << dendl;
+    return -EIO;
+  }
+  return 0;
+}

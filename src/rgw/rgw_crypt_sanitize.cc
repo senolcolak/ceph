@@ -20,6 +20,7 @@ const char* x_amz_server_side_encryption_customer_key = "x-amz-server-side-encry
 const char* x_amz_copy_source_server_side_encryption_customer_key = "x-amz-copy-source-server-side-encryption-customer-key";
 const char* dollar_x_amz_server_side_encryption_customer_key = "$x-amz-server-side-encryption-customer-key";
 const char* dollar_x_amz_copy_source_server_side_encryption_customer_key = "$x-amz-copy-source-server-side-encryption-customer-key";
+const char* x_amz_security_token = "x-amz-security-token";
 const char* suppression_message = "=suppressed due to key presence=";
 
 std::ostream& operator<<(std::ostream& out, const env& e) {
@@ -51,9 +52,10 @@ std::ostream& operator<<(std::ostream& out, const env& e) {
 }
 
 std::ostream& operator<<(std::ostream& out, const x_meta_map& x) {
-  if (g_ceph_context->_conf->rgw_crypt_suppress_logs &&
+  if (boost::algorithm::iequals(x.name, x_amz_security_token) ||
+      (g_ceph_context->_conf->rgw_crypt_suppress_logs &&
       (boost::algorithm::iequals(x.name, x_amz_server_side_encryption_customer_key) ||
-       boost::algorithm::iequals(x.name, x_amz_copy_source_server_side_encryption_customer_key)))
+       boost::algorithm::iequals(x.name, x_amz_copy_source_server_side_encryption_customer_key))))
   {
     out << suppression_message;
     return out;
@@ -87,9 +89,10 @@ std::ostream& operator<<(std::ostream& out, const auth& x) {
 }
 
 std::ostream& operator<<(std::ostream& out, const log_content& x) {
-  if (g_ceph_context->_conf->rgw_crypt_suppress_logs &&
+  if (boost::algorithm::ifind_first(x.buf, x_amz_security_token) ||
+      (g_ceph_context->_conf->rgw_crypt_suppress_logs &&
       (boost::algorithm::ifind_first(x.buf, x_amz_server_side_encryption_customer_key) ||
-       boost::algorithm::ifind_first(x.buf, x_amz_copy_source_server_side_encryption_customer_key))) {
+       boost::algorithm::ifind_first(x.buf, x_amz_copy_source_server_side_encryption_customer_key)))) {
     out << suppression_message;
     return out;
   }

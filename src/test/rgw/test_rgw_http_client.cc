@@ -2,11 +2,25 @@
 // vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include <gtest/gtest.h>
+#include <atomic>
+#include <memory>
 #include <sstream>
 
 #include "rgw_http_client.h"
 
 using namespace std;
+
+namespace {
+
+std::atomic<unsigned> open_socket_calls{0};
+
+curl_socket_t reject_socket_probe(void*, curlsocktype, curl_sockaddr*)
+{
+  ++open_socket_calls;
+  return CURL_SOCKET_BAD;
+}
+
+} // anonymous namespace
 
 // Tests for RGWEndpoint
 
@@ -15,6 +29,32 @@ TEST(RGWEndpointTest, default_constructor) {
   EXPECT_TRUE(ep.get_url().empty());
   EXPECT_TRUE(ep.get_endpoint_url_lookup_id().empty());
   EXPECT_TRUE(ep.get_connect_to().empty());
+  EXPECT_EQ(RGWEndpointAddressPolicy::unrestricted, ep.get_address_policy());
+}
+
+TEST(RGWEndpointTest, address_policy_is_preserved) {
+  RGWEndpoint ep("https://example.com");
+  ep.set_address_policy(RGWEndpointAddressPolicy::reject_prohibited);
+  RGWEndpoint copy = ep;
+  EXPECT_EQ(RGWEndpointAddressPolicy::reject_prohibited,
+            copy.get_address_policy());
+}
+
+TEST(RGWHTTPClientTest, RejectProhibitedInstallsOpenSocketCallback)
+{
+  std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> easy{
+    curl_easy_init(), curl_easy_cleanup};
+  ASSERT_NE(nullptr, easy);
+  ASSERT_EQ(0, rgw_apply_reject_prohibited_address_policy(
+                 easy.get(), reject_socket_probe));
+  ASSERT_EQ(CURLE_OK,
+            curl_easy_setopt(easy.get(), CURLOPT_URL, "http://127.0.0.1:1/"));
+  ASSERT_EQ(CURLE_OK,
+            curl_easy_setopt(easy.get(), CURLOPT_CONNECTTIMEOUT_MS, 100L));
+
+  open_socket_calls = 0;
+  EXPECT_NE(CURLE_OK, curl_easy_perform(easy.get()));
+  EXPECT_GT(open_socket_calls.load(), 0u);
 }
 
 TEST(RGWEndpointTest, constructor_sets_url_and_lookup_id) {

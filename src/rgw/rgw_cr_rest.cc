@@ -291,7 +291,7 @@ int RGWStreamSpliceCR::operate(const DoutPrefixProvider *dpp) {
 
         if (retcode < 0) {
           ldout(cct, 20) << __func__ << ": in_crf->read() retcode=" << retcode << dendl;
-          return set_cr_error(ret);
+          return set_cr_error(retcode);
         }
       } while (need_retry);
 
@@ -332,7 +332,7 @@ int RGWStreamSpliceCR::operate(const DoutPrefixProvider *dpp) {
 
         if (retcode < 0) {
           ldout(cct, 20) << __func__ << ": out_crf->write() retcode=" << retcode << dendl;
-          return set_cr_error(ret);
+          return set_cr_error(retcode);
         }
       } while (need_retry);
     } while (true);
@@ -344,10 +344,14 @@ int RGWStreamSpliceCR::operate(const DoutPrefixProvider *dpp) {
           return set_cr_error(ret);
         }
       }
+      if (retcode < 0) {
+        ldout(cct, 20) << __func__ << ": out_crf->drain_writes() retcode="
+                       << retcode << dendl;
+        return set_cr_error(retcode);
+      }
     } while (need_retry);
 
     return set_cr_done();
   }
   return 0;
 }
-

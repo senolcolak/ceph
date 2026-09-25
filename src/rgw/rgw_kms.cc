@@ -5,10 +5,8 @@
  * Server-side encryption integrations with Key Management Systems (SSE-KMS)
  */
 
-#include <sys/stat.h>
 #include <optional>
 #include "include/str_map.h"
-#include "common/safe_io.h"
 #include "rgw/rgw_crypt.h"
 #include "rgw/rgw_keystone.h"
 #include "rgw/rgw_b64.h"
@@ -16,6 +14,7 @@
 #include "rgw/rgw_kmip_client.h"
 #include "rgw/rgw_perf_counters.h"
 #include "rgw_kms_cache.h"
+#include "rgw_vault_client.h"
 #include "rgw_string.h"
 #include <rapidjson/allocators.h>
 #include <rapidjson/document.h>
@@ -217,49 +216,6 @@ protected:
   CephContext *cct;
   SSEContext & kctx;
 
-  int load_token_from_file(const DoutPrefixProvider *dpp, std::string *vault_token)
-  {
-
-    int res = 0;
-    std::string token_file = kctx.token_file();
-    if (token_file.empty()) {
-      ldpp_dout(dpp, 0) << "ERROR: Vault token file not set in rgw_crypt_vault_token_file" << dendl;
-      return -EINVAL;
-    }
-    ldpp_dout(dpp, 20) << "Vault token file: " << token_file << dendl;
-
-    struct stat token_st;
-    if (stat(token_file.c_str(), &token_st) != 0) {
-      ldpp_dout(dpp, 0) << "ERROR: Vault token file '" << token_file << "' not found  " << dendl;
-      return -ENOENT;
-    }
-
-    if (token_st.st_mode & (S_IWGRP | S_IXGRP | S_IRWXO)) {
-      ldpp_dout(dpp, 0) << "ERROR: Vault token file '" << token_file << "' permissions are "
-                    << "too open, the maximum allowed is 0740" << dendl;
-      return -EACCES;
-    }
-
-    char buf[2048];
-    res = safe_read_file("", token_file.c_str(), buf, sizeof(buf));
-    if (res < 0) {
-      if (-EACCES == res) {
-        ldpp_dout(dpp, 0) << "ERROR: Permission denied reading Vault token file" << dendl;
-      } else {
-        ldpp_dout(dpp, 0) << "ERROR: Failed to read Vault token file with error " << res << dendl;
-      }
-      return res;
-    }
-    // drop trailing newlines
-    while (res && isspace(buf[res-1])) {
-      --res;
-    }
-    vault_token->assign(std::string{buf, static_cast<size_t>(res)});
-    memset(buf, 0, sizeof(buf));
-    ::ceph::crypto::zeroize_for_security(buf, sizeof(buf));
-    return res;
-  }
-
   FORTEST_VIRTUAL
   int send_request(const DoutPrefixProvider *dpp, const char *method, std::string_view infix,
     std::string_view key_id,
@@ -267,74 +223,24 @@ protected:
     optional_yield y,
     bufferlist &secret_bl)
   {
-    int res;
-    string vault_token = "";
-    if (RGW_SSE_KMS_VAULT_AUTH_TOKEN == kctx.auth()){
-      ldpp_dout(dpp, 20) << "Loading Vault Token from filesystem" << dendl;
-      res = load_token_from_file(dpp, &vault_token);
-      if (res < 0){
-        return res;
-      }
+    std::string path(infix);
+    if (!path.empty() && path.back() != '/') {
+      path.push_back('/');
     }
-
-    std::string secret_url = kctx.addr();
-    if (secret_url.empty()) {
-      ldpp_dout(dpp, 0) << "ERROR: Vault address not set in rgw_crypt_vault_addr" << dendl;
-      return -EINVAL;
-    }
-
-    concat_url(secret_url, kctx.prefix());
-    concat_url(secret_url, std::string(infix));
-    concat_url(secret_url, std::string(key_id));
-
-    RGWHTTPTransceiver secret_req(cct, method, secret_url, &secret_bl);
-
-    if (postdata.length()) {
-      secret_req.set_post_data(postdata);
-      secret_req.set_send_length(postdata.length());
-      secret_req.append_header("Content-Type", "application/json");
-    }
-
-    if (!vault_token.empty()) {
-      secret_req.append_header("X-Vault-Token", vault_token);
-    }
-
-    string vault_namespace = kctx.k_namespace();
-    if (!vault_namespace.empty()){
-      ldpp_dout(dpp, 20) << "Vault Namespace: " << vault_namespace << dendl;
-      secret_req.append_header("X-Vault-Namespace", vault_namespace);
-    }
-
-    secret_req.set_verify_ssl(kctx.verify_ssl());
-
-    if (!kctx.ssl_cacert().empty()) {
-      secret_req.set_ca_path(kctx.ssl_cacert());
-    }
-
-    if (!kctx.ssl_clientcert().empty()) {
-      secret_req.set_client_cert(kctx.ssl_clientcert());
-    }
-    if (!kctx.ssl_clientkey().empty()) {
-      secret_req.set_client_key(kctx.ssl_clientkey());
-    }
-
-    res = secret_req.process(dpp, y);
-
-    // map 401 to EACCES instead of EPERM
-    if (secret_req.get_http_status() ==
-        RGWHTTPTransceiver::HTTP_STATUS_UNAUTHORIZED) {
-      ldpp_dout(dpp, 0) << "ERROR: Vault request failed authorization" << dendl;
-      return -EACCES;
-    }
-    if (res < 0) {
-      ldpp_dout(dpp, 0) << "ERROR: Request to Vault failed with error " << res << dendl;
-      return res;
-    }
-
-    ldpp_dout(dpp, 20) << "Request to Vault returned " << res << " and HTTP status "
-      << secret_req.get_http_status() << dendl;
-
-    return res;
+    path.append(key_id);
+    RGWVaultConfig config{
+      .address = kctx.addr(),
+      .auth = kctx.auth(),
+      .token_file = kctx.token_file(),
+      .namespace_name = kctx.k_namespace(),
+      .prefix = kctx.prefix(),
+      .ssl_cacert = kctx.ssl_cacert(),
+      .ssl_clientcert = kctx.ssl_clientcert(),
+      .ssl_clientkey = kctx.ssl_clientkey(),
+      .verify_ssl = kctx.verify_ssl(),
+    };
+    return RGWVaultClient(cct, std::move(config)).request(
+      dpp, method, path, postdata, y, secret_bl);
   }
 
   int send_request(const DoutPrefixProvider *dpp, std::string_view key_id,

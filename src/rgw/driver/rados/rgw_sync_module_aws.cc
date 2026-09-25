@@ -10,6 +10,7 @@
 #include "rgw_sync_module.h"
 #include "rgw_data_sync.h"
 #include "rgw_sync_module_aws.h"
+#include "rgw_sync_s3_transfer.h"
 #include "rgw_cr_rados.h"
 #include "rgw_rest_conn.h"
 #include "rgw_cr_rest.h"
@@ -696,111 +697,17 @@ struct AWSSyncInstanceEnv {
   }
 };
 
-static int do_decode_rest_obj(const DoutPrefixProvider *dpp, CephContext *cct, map<string, bufferlist>& attrs, map<string, string>& headers, rgw_rest_obj *info)
-{
-  for (auto header : headers) {
-    const string& val = header.second;
-    if (header.first == "RGWX_OBJECT_SIZE") {
-      info->content_len = atoi(val.c_str());
-    } else {
-      info->attrs[header.first] = val;
-    }
-  }
-
-  auto aiter = attrs.find(RGW_ATTR_ACL);
-  if (aiter != attrs.end()) {
-    bufferlist& bl = aiter->second;
-    auto bliter = bl.cbegin();
-    try {
-      info->acls.decode(bliter);
-    } catch (buffer::error& err) {
-      ldpp_dout(dpp, 0) << "ERROR: failed to decode policy off attrs" << dendl;
-      return -EIO;
-    }
-  } else {
-    ldpp_dout(dpp, 0) << "WARNING: acl attrs not provided" << dendl;
-  }
-
-  return 0;
-}
-
-class RGWRESTStreamGetCRF : public RGWStreamReadHTTPResourceCRF
-{
-  RGWDataSyncCtx *sc;
-  RGWRESTConn *conn;
-  const rgw_obj& src_obj;
-  RGWRESTConn::get_obj_params req_params;
-
-  rgw_sync_aws_src_obj_properties src_properties;
-public:
-  RGWRESTStreamGetCRF(CephContext *_cct,
-                               RGWCoroutinesEnv *_env,
-                               RGWCoroutine *_caller,
-                               RGWDataSyncCtx *_sc,
-                               RGWRESTConn *_conn,
-                               const rgw_obj& _src_obj,
-                               const rgw_sync_aws_src_obj_properties& _src_properties) : RGWStreamReadHTTPResourceCRF(_cct, _env, _caller,
-                                                                                                                      _sc->env->http_manager, _src_obj.key),
-                                                                                 sc(_sc), conn(_conn), src_obj(_src_obj),
-                                                                                 src_properties(_src_properties) {
-  }
-
-  int init(const DoutPrefixProvider *dpp) override {
-    /* init input connection */
-
-
-    req_params.get_op = true;
-    req_params.prepend_metadata = true;
-
-    req_params.unmod_ptr = &src_properties.mtime;
-    req_params.etag = src_properties.etag;
-    req_params.mod_zone_id = src_properties.zone_short_id;
-    req_params.mod_pg_ver = src_properties.pg_ver;
-
-    if (range.is_set) {
-      req_params.range_is_set = true;
-      req_params.range_start = range.ofs;
-      req_params.range_end = range.ofs + range.size - 1;
-    }
-
-    RGWRESTStreamRWRequest *in_req;
-    int ret = conn->get_obj(dpp, src_obj, req_params, false /* send */, &in_req);
-    if (ret < 0) {
-      ldpp_dout(dpp, 0) << "ERROR: " << __func__ << "(): conn->get_obj() returned ret=" << ret << dendl;
-      return ret;
-    }
-
-    set_req(in_req);
-
-    return RGWStreamReadHTTPResourceCRF::init(dpp);
-  }
-
-  int decode_rest_obj(const DoutPrefixProvider *dpp, map<string, string>& headers, bufferlist& extra_data) override {
-    map<string, bufferlist> src_attrs;
-
-    ldpp_dout(dpp, 20) << __func__ << ":" << " headers=" << headers << " extra_data.length()=" << extra_data.length() << dendl;
-
-    if (extra_data.length() > 0) {
-      JSONParser jp;
-      if (!jp.parse(extra_data.c_str(), extra_data.length())) {
-        ldpp_dout(dpp, 0) << "ERROR: failed to parse response extra data. len=" << extra_data.length() << " data=" << extra_data.c_str() << dendl;
-        return -EIO;
-      }
-
-      JSONDecoder::decode_json("attrs", src_attrs, &jp);
-    }
-    return do_decode_rest_obj(dpp, sc->cct, src_attrs, headers, &rest_obj);
-  }
-
-  bool need_extra_data() override {
-    return true;
-  }
-};
-
 static std::set<string> keep_headers = { "CONTENT_TYPE",
                                          "CONTENT_ENCODING",
                                          "CONTENT_DISPOSITION",
                                          "CONTENT_LANGUAGE" };
+
+static rgw::sync::s3::SourceProperties source_properties(
+  const rgw_sync_aws_src_obj_properties& properties)
+{
+  return {properties.mtime, properties.etag, properties.zone_short_id,
+          properties.pg_ver};
+}
 
 class RGWAWSStreamPutCRF : public RGWStreamWriteHTTPResourceCRF
 {
@@ -1033,13 +940,21 @@ public:
   int operate(const DoutPrefixProvider *dpp) override {
     reenter(this) {
       /* init input */
-      in_crf.reset(new RGWRESTStreamGetCRF(cct, get_env(), this, sc,
-                                           source_conn, src_obj,
-                                           src_properties));
+      in_crf.reset(new rgw::sync::s3::StreamGetCRF(
+        cct, get_env(), this, sc->env->http_manager, source_conn, src_obj,
+        source_properties(src_properties)));
 
       /* init output */
-      out_crf.reset(new RGWAWSStreamPutCRF(cct, get_env(), this, sc,
-                                           src_properties, target, dest_obj));
+      out_crf.reset(new rgw::sync::s3::StreamPutCRF(
+        cct, get_env(), this, sc->env->http_manager,
+        rgw::sync::s3::make_rest_target(target->conn),
+        dest_obj,
+        [sc = sc, src_properties = src_properties, target = target]
+        (const DoutPrefixProvider* dpp, const rgw_rest_obj& rest_obj,
+         map<string, string>* attrs) {
+          RGWAWSStreamPutCRF::init_send_attrs(
+            dpp, sc->cct, rest_obj, src_properties, target.get(), attrs);
+        }));
 
       yield call(new RGWStreamSpliceCR(cct, sc->env->http_manager, in_crf, out_crf));
       if (retcode < 0) {
@@ -1094,9 +1009,9 @@ public:
   int operate(const DoutPrefixProvider *dpp) override {
     reenter(this) {
       /* init input */
-      in_crf.reset(new RGWRESTStreamGetCRF(cct, get_env(), this, sc,
-                                           source_conn, src_obj,
-                                           src_properties));
+      in_crf.reset(new rgw::sync::s3::StreamGetCRF(
+        cct, get_env(), this, sc->env->http_manager, source_conn, src_obj,
+        source_properties(src_properties)));
 
       in_crf->set_range(part_info.ofs, part_info.size);
 
@@ -1693,7 +1608,8 @@ public:
         } else {
           rgw_rest_obj rest_obj;
           rest_obj.init(key);
-          if (do_decode_rest_obj(dpp, sc->cct, attrs, headers, &rest_obj)) {
+          if (rgw::sync::s3::decode_rest_obj(
+                dpp, attrs, headers, &rest_obj)) {
             ldpp_dout(dpp, 0) << "ERROR: failed to decode rest obj out of headers=" << headers << ", attrs=" << attrs << dendl;
             return set_cr_error(-EINVAL);
           }
@@ -1754,9 +1670,9 @@ public:
         string path =  instance.conf.get_path(target, sync_pipe.dest_bucket_info, key);
         ldpp_dout(dpp, 0) << "AWS: removing aws object at" << path << dendl;
 
-        call(new RGWDeleteRESTResourceCR(sc->cct, target->conn.get(),
-                                         sc->env->http_manager,
-                                         path, nullptr /* params */));
+        call(rgw::sync::s3::delete_object(
+          sc->cct, rgw::sync::s3::make_rest_target(target->conn),
+          sc->env->http_manager, path));
       }
       if (retcode < 0) {
         return set_cr_error(retcode);
